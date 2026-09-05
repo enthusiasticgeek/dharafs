@@ -1,0 +1,46 @@
+// Standalone round-trip test for the extracted DharaFS package.
+// Proves the package works with zero dependency on any Dhruva OS
+// kernel code: only the consumer-provided externs in test/host_stubs.c
+// (an in-memory "disk", a calloc-backed allocator, stdout logging, an
+// always-off crypto stub) and the bundled runtime/dharafs_runtime.c.
+//
+// Run with:
+//   vanic run test/host_test.vani --backend=c \
+//     --link-with runtime/dharafs_runtime.c --link-with test/host_stubs.c
+
+use "../src/lib.vani";
+
+fn main() -> i64 {
+  let init_status: i64 = dharafs_init();
+  assert init_status == 0;
+
+  let append_status: i64 = dharafs_append("hello.txt", "hello, dharafs");
+  assert append_status == 0;
+
+  let read_buf: mut ref i64 = dharafs_alloc_bytes(4096);
+  let read_len: i64 = dharafs_read("hello.txt", read_buf);
+  assert read_len == 14; // str_len_bytes("hello, dharafs")
+  assert buf_read_byte(read_buf, 0 as u32) == (104 as u32); // 'h'
+  assert buf_read_byte(read_buf, 13 as u32) == (115 as u32); // 's'
+
+  let append2_status: i64 = dharafs_append("hello.txt", "hello, dharafs -- v2");
+  assert append2_status == 0;
+  let read2_len: i64 = dharafs_read("hello.txt", read_buf);
+  assert read2_len == 20; // str_len_bytes("hello, dharafs -- v2")
+  assert buf_read_byte(read_buf, 19 as u32) == (50 as u32); // '2'
+
+  let rename_status: i64 = dharafs_rename("hello.txt", "renamed.txt");
+  assert rename_status == 0;
+  let read3_len: i64 = dharafs_read("renamed.txt", read_buf);
+  assert read3_len == 20;
+  let read_old_len: i64 = dharafs_read("hello.txt", read_buf);
+  assert read_old_len < 0;
+
+  let delete_status: i64 = dharafs_delete("renamed.txt");
+  assert delete_status == 0;
+  let read_deleted_len: i64 = dharafs_read("renamed.txt", read_buf);
+  assert read_deleted_len < 0;
+
+  let _ = dharafs_log_puts("DharaFS standalone round trip: PASS\n");
+  return 0;
+}

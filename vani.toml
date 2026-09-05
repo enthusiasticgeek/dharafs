@@ -1,0 +1,14 @@
+[package]
+name        = "dharafs"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "Kernel-agnostic log-structured filesystem: append-only records, checksums, permissions/attributes, rename+transactions, a hashed directory index, and snapshots. Extracted from Dhruva OS. Requires the consuming kernel to provide block I/O, an allocator, and a logging sink -- see README.md."
+registry    = "kosh"
+
+[deps]
+# No external deps -- the media-encryption hook calls out to
+# consumer-provided extern functions (see README.md) rather than
+# vendoring a crypto suite; a real AEAD implementation is a separate,
+# optional add-on, not a hard dependency of the core filesystem.
