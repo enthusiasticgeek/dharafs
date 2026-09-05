@@ -1,0 +1,9 @@
+// DharaFS -- core filesystem + real ChaCha20-Poly1305 AEAD media
+// encryption, WITHOUT verified I/O. Link: runtime/dharafs_runtime.c,
+// runtime/dharafs_crypto_runtime.c, runtime/dharafs_media_crypto_runtime.c.
+// See README.md's "Tier 2" section and src/media_crypto.vani's own
+// header comment.
+
+use "./core.vani";
+use "./crypto.vani";
+use "./media_crypto.vani";

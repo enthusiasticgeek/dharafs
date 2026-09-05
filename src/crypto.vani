@@ -1,0 +1,898 @@
+// DharaFS crypto primitives: SHA-256 (FIPS 180-4), HMAC-SHA256
+// (RFC 2104), PBKDF2-HMAC-SHA256 (RFC 8018), ChaCha20 (RFC 8439),
+// Poly1305 (RFC 8439), and the ChaCha20-Poly1305 AEAD construction
+// (RFC 8439 section 2.8).
+//
+// Ported verbatim from Dhruva OS's own kernel/kernel_main.vani (rounds
+// 41/67), where every one of these was independently verified before
+// ever being trusted: SHA-256/HMAC/PBKDF2 against known-answer vectors
+// from their own RFCs and NIST; ChaCha20/Poly1305/AEAD against a
+// from-scratch Python port cross-checked against the real
+// `cryptography` library across dozens of random trials, PLUS the
+// RFC 8439 worked examples. See test/host_test_tier2.vani for the
+// same class of known-answer checks re-run against this ported copy.
+//
+// Pure algorithms: zero filesystem dependency, zero OS dependency --
+// only the mechanical buf_*/scratch-accessor externs every other file
+// in this package already needs, all provided by
+// runtime/dharafs_runtime.c. Deliberately usable on its own (`use
+// "./crypto.vani";` alone, without core.vani) by anything that just
+// wants a KAT-verified SHA-256/ChaCha20-Poly1305 implementation and
+// nothing else -- this file has no idea DharaFS (the filesystem)
+// exists.
+
+use "./buf_primitives.vani";
+
+extern "C" fn sha256_h_scratch_get() -> mut ref i64;
+extern "C" fn sha256_k_scratch_get() -> mut ref i64;
+extern "C" fn sha256_w_scratch_get() -> mut ref i64;
+extern "C" fn sha256_padded_scratch_get() -> mut ref i64;
+
+extern "C" fn hmac_key_block_ptr() -> mut ref i64;
+extern "C" fn hmac_msg_scratch_ptr() -> mut ref i64;
+extern "C" fn hmac_inner_hash_ptr() -> mut ref i64;
+
+extern "C" fn pbkdf2_salt_ctr_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_u_ptr() -> mut ref i64;
+extern "C" fn pbkdf2_t_ptr() -> mut ref i64;
+
+// ---- SHA-256 (FIPS 180-4) ----
+
+fn sha256_wrap_add32(a: u32, b: u32) -> u32 {
+  let wide: i64 = (a as i64) + (b as i64);
+  return (wide & 4294967295) as u32;
+}
+
+fn sha256_rotr32(x: u32, n: u32) -> u32 {
+  return (x >> n) | (x << ((32 as u32) - n));
+}
+
+// The 64 round constants: first 32 bits of the fractional parts of the
+// cube roots of the first 64 primes (FIPS 180-4 section 4.2.2).
+fn sha256_k_init(k: mut ref i64) -> i64 {
+  let _ = buf_write_u32(k, 0 as u32, 0x428a2f98 as u32);
+  let _ = buf_write_u32(k, 4 as u32, 0x71374491 as u32);
+  let _ = buf_write_u32(k, 8 as u32, 0xb5c0fbcf as u32);
+  let _ = buf_write_u32(k, 12 as u32, 0xe9b5dba5 as u32);
+  let _ = buf_write_u32(k, 16 as u32, 0x3956c25b as u32);
+  let _ = buf_write_u32(k, 20 as u32, 0x59f111f1 as u32);
+  let _ = buf_write_u32(k, 24 as u32, 0x923f82a4 as u32);
+  let _ = buf_write_u32(k, 28 as u32, 0xab1c5ed5 as u32);
+  let _ = buf_write_u32(k, 32 as u32, 0xd807aa98 as u32);
+  let _ = buf_write_u32(k, 36 as u32, 0x12835b01 as u32);
+  let _ = buf_write_u32(k, 40 as u32, 0x243185be as u32);
+  let _ = buf_write_u32(k, 44 as u32, 0x550c7dc3 as u32);
+  let _ = buf_write_u32(k, 48 as u32, 0x72be5d74 as u32);
+  let _ = buf_write_u32(k, 52 as u32, 0x80deb1fe as u32);
+  let _ = buf_write_u32(k, 56 as u32, 0x9bdc06a7 as u32);
+  let _ = buf_write_u32(k, 60 as u32, 0xc19bf174 as u32);
+  let _ = buf_write_u32(k, 64 as u32, 0xe49b69c1 as u32);
+  let _ = buf_write_u32(k, 68 as u32, 0xefbe4786 as u32);
+  let _ = buf_write_u32(k, 72 as u32, 0x0fc19dc6 as u32);
+  let _ = buf_write_u32(k, 76 as u32, 0x240ca1cc as u32);
+  let _ = buf_write_u32(k, 80 as u32, 0x2de92c6f as u32);
+  let _ = buf_write_u32(k, 84 as u32, 0x4a7484aa as u32);
+  let _ = buf_write_u32(k, 88 as u32, 0x5cb0a9dc as u32);
+  let _ = buf_write_u32(k, 92 as u32, 0x76f988da as u32);
+  let _ = buf_write_u32(k, 96 as u32, 0x983e5152 as u32);
+  let _ = buf_write_u32(k, 100 as u32, 0xa831c66d as u32);
+  let _ = buf_write_u32(k, 104 as u32, 0xb00327c8 as u32);
+  let _ = buf_write_u32(k, 108 as u32, 0xbf597fc7 as u32);
+  let _ = buf_write_u32(k, 112 as u32, 0xc6e00bf3 as u32);
+  let _ = buf_write_u32(k, 116 as u32, 0xd5a79147 as u32);
+  let _ = buf_write_u32(k, 120 as u32, 0x06ca6351 as u32);
+  let _ = buf_write_u32(k, 124 as u32, 0x14292967 as u32);
+  let _ = buf_write_u32(k, 128 as u32, 0x27b70a85 as u32);
+  let _ = buf_write_u32(k, 132 as u32, 0x2e1b2138 as u32);
+  let _ = buf_write_u32(k, 136 as u32, 0x4d2c6dfc as u32);
+  let _ = buf_write_u32(k, 140 as u32, 0x53380d13 as u32);
+  let _ = buf_write_u32(k, 144 as u32, 0x650a7354 as u32);
+  let _ = buf_write_u32(k, 148 as u32, 0x766a0abb as u32);
+  let _ = buf_write_u32(k, 152 as u32, 0x81c2c92e as u32);
+  let _ = buf_write_u32(k, 156 as u32, 0x92722c85 as u32);
+  let _ = buf_write_u32(k, 160 as u32, 0xa2bfe8a1 as u32);
+  let _ = buf_write_u32(k, 164 as u32, 0xa81a664b as u32);
+  let _ = buf_write_u32(k, 168 as u32, 0xc24b8b70 as u32);
+  let _ = buf_write_u32(k, 172 as u32, 0xc76c51a3 as u32);
+  let _ = buf_write_u32(k, 176 as u32, 0xd192e819 as u32);
+  let _ = buf_write_u32(k, 180 as u32, 0xd6990624 as u32);
+  let _ = buf_write_u32(k, 184 as u32, 0xf40e3585 as u32);
+  let _ = buf_write_u32(k, 188 as u32, 0x106aa070 as u32);
+  let _ = buf_write_u32(k, 192 as u32, 0x19a4c116 as u32);
+  let _ = buf_write_u32(k, 196 as u32, 0x1e376c08 as u32);
+  let _ = buf_write_u32(k, 200 as u32, 0x2748774c as u32);
+  let _ = buf_write_u32(k, 204 as u32, 0x34b0bcb5 as u32);
+  let _ = buf_write_u32(k, 208 as u32, 0x391c0cb3 as u32);
+  let _ = buf_write_u32(k, 212 as u32, 0x4ed8aa4a as u32);
+  let _ = buf_write_u32(k, 216 as u32, 0x5b9cca4f as u32);
+  let _ = buf_write_u32(k, 220 as u32, 0x682e6ff3 as u32);
+  let _ = buf_write_u32(k, 224 as u32, 0x748f82ee as u32);
+  let _ = buf_write_u32(k, 228 as u32, 0x78a5636f as u32);
+  let _ = buf_write_u32(k, 232 as u32, 0x84c87814 as u32);
+  let _ = buf_write_u32(k, 236 as u32, 0x8cc70208 as u32);
+  let _ = buf_write_u32(k, 240 as u32, 0x90befffa as u32);
+  let _ = buf_write_u32(k, 244 as u32, 0xa4506ceb as u32);
+  let _ = buf_write_u32(k, 248 as u32, 0xbef9a3f7 as u32);
+  let _ = buf_write_u32(k, 252 as u32, 0xc67178f2 as u32);
+  return 0;
+}
+
+fn sha256_h_init() -> i64 {
+  let _ = buf_write_u32(sha256_h_scratch_get(), 0 as u32, 0x6a09e667 as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 4 as u32, 0xbb67ae85 as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 8 as u32, 0x3c6ef372 as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 12 as u32, 0xa54ff53a as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 16 as u32, 0x510e527f as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 20 as u32, 0x9b05688c as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 24 as u32, 0x1f83d9ab as u32);
+  let _ = buf_write_u32(sha256_h_scratch_get(), 28 as u32, 0x5be0cd19 as u32);
+  return 0;
+}
+
+// Message bytes are big-endian 32-bit words per FIPS 180-4, unlike
+// buf_read_u32/buf_write_u32 (native little-endian) -- so message-
+// block parsing and digest-byte output both go through explicit
+// big-endian byte packing here.
+fn sha256_read_be32(buf: mut ref i64, off: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, off as u32);
+  let b1: u32 = buf_read_byte(buf, (off + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (off + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (off + 3) as u32);
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn sha256_write_be32(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, (v >> (24 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, (v >> (16 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 2) as u32, (v >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 3) as u32, v & (255 as u32));
+  return 0;
+}
+
+// Process one 64-byte block starting at byte offset `block_off` inside
+// `msg`, folding it into the running state (sha256_h_scratch_get()).
+// h/w/k are always re-fetched fresh via their own *_scratch_get() at
+// every point of use rather than held live in one local/register
+// across this whole ~64-round function -- upstream's own round-65
+// hardening (see kernel_main.vani's own comment history), kept intact
+// here rather than "simplified" back to holding them live, since that
+// exact shape was the fix for two real, hard-to-reproduce crashes.
+fn sha256_compress(msg: mut ref i64, block_off: i64) -> i64 {
+  let i: i64 = 0;
+  while i < 16 {
+    let word: u32 = sha256_read_be32(msg, block_off + i * 4);
+    let _ = buf_write_u32(sha256_w_scratch_get(), (i * 4) as u32, word);
+    i = i + 1;
+  }
+  i = 16;
+  while i < 64 {
+    let w15: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 15) * 4) as u32);
+    let w2: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 2) * 4) as u32);
+    let w16: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 16) * 4) as u32);
+    let w7: u32 = buf_read_u32(sha256_w_scratch_get(), ((i - 7) * 4) as u32);
+    let s0: u32 = sha256_rotr32(w15, 7 as u32) ^ sha256_rotr32(w15, 18 as u32) ^ (w15 >> (3 as u32));
+    let s1: u32 = sha256_rotr32(w2, 17 as u32) ^ sha256_rotr32(w2, 19 as u32) ^ (w2 >> (10 as u32));
+    let wi: u32 = sha256_wrap_add32(sha256_wrap_add32(w16, s0), sha256_wrap_add32(w7, s1));
+    let _ = buf_write_u32(sha256_w_scratch_get(), (i * 4) as u32, wi);
+    i = i + 1;
+  }
+
+  let a: u32 = buf_read_u32(sha256_h_scratch_get(), 0 as u32);
+  let b: u32 = buf_read_u32(sha256_h_scratch_get(), 4 as u32);
+  let c: u32 = buf_read_u32(sha256_h_scratch_get(), 8 as u32);
+  let d: u32 = buf_read_u32(sha256_h_scratch_get(), 12 as u32);
+  let e: u32 = buf_read_u32(sha256_h_scratch_get(), 16 as u32);
+  let f: u32 = buf_read_u32(sha256_h_scratch_get(), 20 as u32);
+  let g: u32 = buf_read_u32(sha256_h_scratch_get(), 24 as u32);
+  let hh: u32 = buf_read_u32(sha256_h_scratch_get(), 28 as u32);
+  let ones: u32 = 4294967295 as u32;
+
+  i = 0;
+  while i < 64 {
+    let bige1: u32 = sha256_rotr32(e, 6 as u32) ^ sha256_rotr32(e, 11 as u32) ^ sha256_rotr32(e, 25 as u32);
+    let ch: u32 = (e & f) ^ ((e ^ ones) & g);
+    let kw: u32 = buf_read_u32(sha256_k_scratch_get(), (i * 4) as u32);
+    let ww: u32 = buf_read_u32(sha256_w_scratch_get(), (i * 4) as u32);
+    let t1: u32 = sha256_wrap_add32(sha256_wrap_add32(hh, bige1), sha256_wrap_add32(ch, sha256_wrap_add32(kw, ww)));
+    let bige0: u32 = sha256_rotr32(a, 2 as u32) ^ sha256_rotr32(a, 13 as u32) ^ sha256_rotr32(a, 22 as u32);
+    let maj: u32 = (a & b) ^ (a & c) ^ (b & c);
+    let t2: u32 = sha256_wrap_add32(bige0, maj);
+
+    hh = g;
+    g = f;
+    f = e;
+    e = sha256_wrap_add32(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = sha256_wrap_add32(t1, t2);
+
+    i = i + 1;
+  }
+
+  let _ = buf_write_u32(sha256_h_scratch_get(), 0 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 0 as u32), a));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 4 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 4 as u32), b));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 8 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 8 as u32), c));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 12 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 12 as u32), d));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 16 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 16 as u32), e));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 20 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 20 as u32), f));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 24 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 24 as u32), g));
+  let _ = buf_write_u32(sha256_h_scratch_get(), 28 as u32, sha256_wrap_add32(buf_read_u32(sha256_h_scratch_get(), 28 as u32), hh));
+  return 0;
+}
+
+// Hashes `msg_len` bytes at `msg` into the 32-byte buffer `out`
+// (FIPS 180-4 padding: a single 0x80 byte, zero bytes up to a
+// 56-mod-64 boundary, then the original bit-length as a big-endian
+// 8-byte integer). msg_len is capped at 4096 (sha256_padded_scratch's
+// own fixed size, matching dharafs_file_max_len()) -- comfortably
+// covers every real caller in this package (whole-file SHA-256 for
+// verified I/O).
+//
+// Re-derives the K round-constant table on every call (a deliberate,
+// tiny-cost deviation from upstream, which instead relies on a
+// separate one-time init call at boot): this package has no boot
+// sequence to hook that into, and the alternative -- requiring a
+// consumer to remember an initialization call before ever hashing
+// anything -- is exactly the kind of footgun "should not break in any
+// case" rules out. 64 constant word writes is immeasurable next to
+// the 64-round compression this function already does per block.
+fn sha256_hash(msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  if msg_len > 4096 {
+    return 0 - 1;
+  }
+  let _ = sha256_k_init(sha256_k_scratch_get());
+
+  let with_one: i64 = msg_len + 1;
+  let rem: i64 = with_one % 64;
+  let zero_pad: i64 = 0;
+  if rem <= 56 {
+    zero_pad = 56 - rem;
+  } else {
+    zero_pad = (64 - rem) + 56;
+  }
+  let total_len: i64 = with_one + zero_pad + 8;
+
+  let padded: mut ref i64 = sha256_padded_scratch_get();
+  let i: i64 = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(padded, i as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(padded, msg_len as u32, 128 as u32);
+  i = msg_len + 1;
+  while i < (with_one + zero_pad) {
+    let _ = buf_write_byte(padded, i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let bit_len: i64 = msg_len * 8;
+  let _ = sha256_write_be32(padded, total_len - 8, 0 as u32);
+  let _ = sha256_write_be32(padded, total_len - 4, bit_len as u32);
+
+  let _ = sha256_h_init();
+
+  let num_blocks: i64 = total_len / 64;
+  let blk: i64 = 0;
+  while blk < num_blocks {
+    let _ = sha256_compress(padded, blk * 64);
+    blk = blk + 1;
+  }
+
+  let j: i64 = 0;
+  while j < 8 {
+    let word: u32 = buf_read_u32(sha256_h_scratch_get(), (j * 4) as u32);
+    let _ = sha256_write_be32(out, j * 4, word);
+    j = j + 1;
+  }
+  return 0;
+}
+
+fn sha256_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// ---- HMAC-SHA256 (RFC 2104) ----
+
+fn hmac_sha256(key: mut ref i64, key_len: i64, msg: mut ref i64, msg_len: i64, out: mut ref i64) -> i64 {
+  if msg_len > 64 {
+    return 0 - 1;
+  }
+  let key_block: mut ref i64 = hmac_key_block_ptr();
+  let i: i64 = 0;
+  if key_len > 64 {
+    let _ = sha256_hash(key, key_len, key_block);
+    i = 32;
+  } else {
+    while i < key_len {
+      let _ = buf_write_byte(key_block, i as u32, buf_read_byte(key, i as u32));
+      i = i + 1;
+    }
+  }
+  while i < 64 {
+    let _ = buf_write_byte(key_block, i as u32, 0 as u32);
+    i = i + 1;
+  }
+
+  let msg_scratch: mut ref i64 = hmac_msg_scratch_ptr();
+  i = 0;
+  while i < 64 {
+    let kb: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb ^ (0x36 as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < msg_len {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(msg, i as u32));
+    i = i + 1;
+  }
+  let inner_hash: mut ref i64 = hmac_inner_hash_ptr();
+  let _ = sha256_hash(msg_scratch, 64 + msg_len, inner_hash);
+
+  i = 0;
+  while i < 64 {
+    let kb2: u32 = buf_read_byte(key_block, i as u32);
+    let _ = buf_write_byte(msg_scratch, i as u32, kb2 ^ (0x5c as u32));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(msg_scratch, (64 + i) as u32, buf_read_byte(inner_hash, i as u32));
+    i = i + 1;
+  }
+  let _ = sha256_hash(msg_scratch, 96, out);
+  return 0;
+}
+
+fn hmac_sha256_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// ---- PBKDF2-HMAC-SHA256 (RFC 8018 section 5.2) ----
+// Specialized to dkLen == hLen == 32 bytes (SHA-256's own output
+// size): with dkLen == hLen there is exactly one block, T_1, and
+// DK == T_1. T_1 = U_1 xor U_2 xor ... xor U_c, where U_1 =
+// HMAC(password, salt || INT_32_BE(1)) and U_i = HMAC(password,
+// U_{i-1}) for i > 1. salt_len is capped at 32 bytes
+// (pbkdf2_salt_ctr's own 36-byte scratch size: 32-byte salt + 4-byte
+// block-index counter).
+
+fn pbkdf2_hmac_sha256(password: mut ref i64, password_len: i64, salt: mut ref i64, salt_len: i64, iterations: i64, out: mut ref i64) -> i64 {
+  if salt_len > 32 {
+    return 0 - 1;
+  }
+  let sc: mut ref i64 = pbkdf2_salt_ctr_ptr();
+  let i: i64 = 0;
+  while i < salt_len {
+    let _ = buf_write_byte(sc, i as u32, buf_read_byte(salt, i as u32));
+    i = i + 1;
+  }
+  let _ = buf_write_byte(sc, salt_len as u32, 0 as u32);
+  let _ = buf_write_byte(sc, (salt_len + 1) as u32, 0 as u32);
+  let _ = buf_write_byte(sc, (salt_len + 2) as u32, 0 as u32);
+  let _ = buf_write_byte(sc, (salt_len + 3) as u32, 1 as u32);
+
+  let u: mut ref i64 = pbkdf2_u_ptr();
+  let _ = hmac_sha256(password, password_len, sc, salt_len + 4, u);
+
+  let t: mut ref i64 = pbkdf2_t_ptr();
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(t, i as u32, buf_read_byte(u, i as u32));
+    i = i + 1;
+  }
+
+  let iter: i64 = 1;
+  while iter < iterations {
+    // Safe to alias msg==out==u here: hmac_sha256 fully copies msg into
+    // its own persistent scratch before it ever writes a single byte
+    // of `out`, so U_i overwriting the U_{i-1} it was computed from is
+    // not a read-after-write hazard.
+    let _ = hmac_sha256(password, password_len, u, 32, u);
+    let j: i64 = 0;
+    while j < 32 {
+      let tb: u32 = buf_read_byte(t, j as u32);
+      let ub: u32 = buf_read_byte(u, j as u32);
+      let _ = buf_write_byte(t, j as u32, tb ^ ub);
+      j = j + 1;
+    }
+    iter = iter + 1;
+  }
+
+  i = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out, i as u32, buf_read_byte(t, i as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// ---- ChaCha20 (RFC 8439) ----
+
+fn chacha20_rotl32(x: u32, n: u32) -> u32 {
+  return (x << n) | (x >> ((32 as u32) - n));
+}
+
+// Operates on `state`, a 16-word (64-byte) buffer, indices a/b/c/d
+// selecting which 4 of the 16 words this quarter round mixes (RFC
+// 8439 section 2.2).
+fn chacha20_quarter_round(state: mut ref i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+  let av: u32 = buf_read_u32(state, (a * 4) as u32);
+  let bv: u32 = buf_read_u32(state, (b * 4) as u32);
+  let cv: u32 = buf_read_u32(state, (c * 4) as u32);
+  let dv: u32 = buf_read_u32(state, (d * 4) as u32);
+
+  av = wrapping_add(av, bv);
+  dv = dv ^ av;
+  dv = chacha20_rotl32(dv, 16 as u32);
+
+  cv = wrapping_add(cv, dv);
+  bv = bv ^ cv;
+  bv = chacha20_rotl32(bv, 12 as u32);
+
+  av = wrapping_add(av, bv);
+  dv = dv ^ av;
+  dv = chacha20_rotl32(dv, 8 as u32);
+
+  cv = wrapping_add(cv, dv);
+  bv = bv ^ cv;
+  bv = chacha20_rotl32(bv, 7 as u32);
+
+  let _ = buf_write_u32(state, (a * 4) as u32, av);
+  let _ = buf_write_u32(state, (b * 4) as u32, bv);
+  let _ = buf_write_u32(state, (c * 4) as u32, cv);
+  let _ = buf_write_u32(state, (d * 4) as u32, dv);
+  return 0;
+}
+
+// Produces one 64-byte keystream block into `out`. `key` is 32 bytes,
+// `nonce` is 12 bytes (RFC 8439's IETF variant). `state_buf`/
+// `working_buf` are caller-supplied 64-byte scratch. ChaCha20's own
+// wire format is little-endian throughout (RFC 8439 section 2.3), so
+// buf_read_u32/buf_write_u32's native little-endian byte order already
+// matches the spec exactly -- no explicit byte-order handling needed,
+// unlike SHA-256 above.
+fn chacha20_block(key: mut ref i64, counter: u32, nonce: mut ref i64, state_buf: mut ref i64, working_buf: mut ref i64, out: mut ref i64) -> i64 {
+  let _ = buf_write_u32(state_buf, 0 as u32, 0x61707865 as u32);
+  let _ = buf_write_u32(state_buf, 4 as u32, 0x3320646e as u32);
+  let _ = buf_write_u32(state_buf, 8 as u32, 0x79622d32 as u32);
+  let _ = buf_write_u32(state_buf, 12 as u32, 0x6b206574 as u32);
+
+  let i: i64 = 0;
+  while i < 8 {
+    let kw: u32 = buf_read_u32(key, (i * 4) as u32);
+    let _ = buf_write_u32(state_buf, (16 + i * 4) as u32, kw);
+    i = i + 1;
+  }
+
+  let _ = buf_write_u32(state_buf, 48 as u32, counter);
+
+  let j: i64 = 0;
+  while j < 3 {
+    let nw: u32 = buf_read_u32(nonce, (j * 4) as u32);
+    let _ = buf_write_u32(state_buf, (52 + j * 4) as u32, nw);
+    j = j + 1;
+  }
+
+  let k: i64 = 0;
+  while k < 16 {
+    let w: u32 = buf_read_u32(state_buf, (k * 4) as u32);
+    let _ = buf_write_u32(working_buf, (k * 4) as u32, w);
+    k = k + 1;
+  }
+
+  // 10 double-rounds (4 column quarter-rounds + 4 diagonal quarter-
+  // rounds each) = 20 rounds total, per RFC 8439 section 2.3.
+  let round: i64 = 0;
+  while round < 10 {
+    let _ = chacha20_quarter_round(working_buf, 0, 4, 8, 12);
+    let _ = chacha20_quarter_round(working_buf, 1, 5, 9, 13);
+    let _ = chacha20_quarter_round(working_buf, 2, 6, 10, 14);
+    let _ = chacha20_quarter_round(working_buf, 3, 7, 11, 15);
+    let _ = chacha20_quarter_round(working_buf, 0, 5, 10, 15);
+    let _ = chacha20_quarter_round(working_buf, 1, 6, 11, 12);
+    let _ = chacha20_quarter_round(working_buf, 2, 7, 8, 13);
+    let _ = chacha20_quarter_round(working_buf, 3, 4, 9, 14);
+    round = round + 1;
+  }
+
+  let m: i64 = 0;
+  while m < 16 {
+    let a: u32 = buf_read_u32(working_buf, (m * 4) as u32);
+    let b: u32 = buf_read_u32(state_buf, (m * 4) as u32);
+    let _ = buf_write_u32(out, (m * 4) as u32, wrapping_add(a, b));
+    m = m + 1;
+  }
+  return 0;
+}
+
+// Encrypts (or, identically, decrypts -- ChaCha20 is a symmetric XOR
+// stream cipher) `in_len` bytes from `in_buf` into `out_buf`, using
+// `initial_counter` as the first block's counter value (1, in the AEAD
+// construction below, since block 0 is reserved for Poly1305 key
+// derivation). `keystream_buf` is a 64-byte scratch for one block's
+// worth of keystream bytes.
+fn chacha20_encrypt(key: mut ref i64, nonce: mut ref i64, initial_counter: u32, in_buf: mut ref i64, in_len: i64, state_buf: mut ref i64, working_buf: mut ref i64, keystream_buf: mut ref i64, out_buf: mut ref i64) -> i64 {
+  let counter: u32 = initial_counter;
+  let offset: i64 = 0;
+  while offset < in_len {
+    let _ = chacha20_block(key, counter, nonce, state_buf, working_buf, keystream_buf);
+    let remaining: i64 = in_len - offset;
+    let this_block: i64 = if remaining < 64 { remaining } else { 64 };
+    let i: i64 = 0;
+    while i < this_block {
+      let p: u32 = buf_read_byte(in_buf, (offset + i) as u32);
+      let ks: u32 = buf_read_byte(keystream_buf, i as u32);
+      let _ = buf_write_byte(out_buf, (offset + i) as u32, p ^ ks);
+      i = i + 1;
+    }
+    offset = offset + 64;
+    counter = wrapping_add(counter, 1 as u32);
+  }
+  return 0;
+}
+
+fn chacha20_bytes_equal(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// ---- Poly1305 (RFC 8439 section 2.5) ----
+// Ported from the well-known, widely-audited "poly1305-donna-32"
+// public-domain reference algorithm (radix-2^26, five 32-bit limbs).
+//
+// Unaligned reads: poly1305_read_u32_le reads via 4 explicit
+// buf_read_byte calls rather than buf_read_u32 -- Poly1305's own
+// clamp/accumulate steps need 32-bit little-endian reads at arbitrary
+// (3, 6, 9, 12, ...) byte offsets, and an unaligned native word load
+// is not guaranteed to behave like 4 independent byte reads on every
+// architecture, so this sidesteps that alignment hazard by construction.
+
+fn poly1305_read_u32_le(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (offset + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (offset + 3) as u32);
+  return b0 | (b1 << (8 as u32)) | (b2 << (16 as u32)) | (b3 << (24 as u32));
+}
+
+fn poly1305_write_u32_le(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let _ = buf_write_byte(buf, offset as u32, value & (0xFF as u32));
+  let _ = buf_write_byte(buf, (offset + 1) as u32, (value >> (8 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(buf, (offset + 2) as u32, (value >> (16 as u32)) & (0xFF as u32));
+  let _ = buf_write_byte(buf, (offset + 3) as u32, (value >> (24 as u32)) & (0xFF as u32));
+  return 0;
+}
+
+// key: 32 bytes (first 16 = r, clamped per RFC 8439 section 2.5.1;
+// last 16 = s, added at the end). msg/msg_len: the data to
+// authenticate. block_scratch: a caller-owned, persistent 16-byte
+// buffer used only to build the final, zero-padded partial block.
+// out_tag: 16-byte output.
+fn poly1305_mac(key: mut ref i64, msg: mut ref i64, msg_len: i64, block_scratch: mut ref i64, out_tag: mut ref i64) -> i64 {
+  let r0: u32 = poly1305_read_u32_le(key, 0) & (0x3ffffff as u32);
+  let r1: u32 = (poly1305_read_u32_le(key, 3) >> (2 as u32)) & (0x3ffff03 as u32);
+  let r2: u32 = (poly1305_read_u32_le(key, 6) >> (4 as u32)) & (0x3ffc0ff as u32);
+  let r3: u32 = (poly1305_read_u32_le(key, 9) >> (6 as u32)) & (0x3f03fff as u32);
+  let r4: u32 = (poly1305_read_u32_le(key, 12) >> (8 as u32)) & (0xfffff as u32);
+
+  let s1: u32 = r1 * (5 as u32);
+  let s2: u32 = r2 * (5 as u32);
+  let s3: u32 = r3 * (5 as u32);
+  let s4: u32 = r4 * (5 as u32);
+
+  let h0: u32 = 0 as u32;
+  let h1: u32 = 0 as u32;
+  let h2: u32 = 0 as u32;
+  let h3: u32 = 0 as u32;
+  let h4: u32 = 0 as u32;
+
+  let pad0: u32 = poly1305_read_u32_le(key, 16);
+  let pad1: u32 = poly1305_read_u32_le(key, 20);
+  let pad2: u32 = poly1305_read_u32_le(key, 24);
+  let pad3: u32 = poly1305_read_u32_le(key, 28);
+
+  let mask26: u32 = 0x3ffffff as u32;
+  let full_blocks: i64 = msg_len / 16;
+  let leftover: i64 = msg_len - (full_blocks * 16);
+
+  let blk: i64 = 0;
+  while blk < full_blocks {
+    let off: i64 = blk * 16;
+    h0 = h0 + (poly1305_read_u32_le(msg, off) & mask26);
+    h1 = h1 + ((poly1305_read_u32_le(msg, off + 3) >> (2 as u32)) & mask26);
+    h2 = h2 + ((poly1305_read_u32_le(msg, off + 6) >> (4 as u32)) & mask26);
+    h3 = h3 + ((poly1305_read_u32_le(msg, off + 9) >> (6 as u32)) & mask26);
+    h4 = h4 + ((poly1305_read_u32_le(msg, off + 12) >> (8 as u32)) | (16777216 as u32)); // 1 << 24
+
+    let d0: u64 = ((h0 as u64) * (r0 as u64)) + ((h1 as u64) * (s4 as u64)) + ((h2 as u64) * (s3 as u64)) + ((h3 as u64) * (s2 as u64)) + ((h4 as u64) * (s1 as u64));
+    let d1: u64 = ((h0 as u64) * (r1 as u64)) + ((h1 as u64) * (r0 as u64)) + ((h2 as u64) * (s4 as u64)) + ((h3 as u64) * (s3 as u64)) + ((h4 as u64) * (s2 as u64));
+    let d2: u64 = ((h0 as u64) * (r2 as u64)) + ((h1 as u64) * (r1 as u64)) + ((h2 as u64) * (r0 as u64)) + ((h3 as u64) * (s4 as u64)) + ((h4 as u64) * (s3 as u64));
+    let d3: u64 = ((h0 as u64) * (r3 as u64)) + ((h1 as u64) * (r2 as u64)) + ((h2 as u64) * (r1 as u64)) + ((h3 as u64) * (r0 as u64)) + ((h4 as u64) * (s4 as u64));
+    let d4: u64 = ((h0 as u64) * (r4 as u64)) + ((h1 as u64) * (r3 as u64)) + ((h2 as u64) * (r2 as u64)) + ((h3 as u64) * (r1 as u64)) + ((h4 as u64) * (r0 as u64));
+
+    let mask26_64: u64 = 0x3ffffff as u64;
+    let c0: u64 = d0 >> (26 as u64);
+    h0 = (d0 & mask26_64) as u32;
+    let d1b: u64 = d1 + c0;
+    let c1: u64 = d1b >> (26 as u64);
+    h1 = (d1b & mask26_64) as u32;
+    let d2b: u64 = d2 + c1;
+    let c2: u64 = d2b >> (26 as u64);
+    h2 = (d2b & mask26_64) as u32;
+    let d3b: u64 = d3 + c2;
+    let c3: u64 = d3b >> (26 as u64);
+    h3 = (d3b & mask26_64) as u32;
+    let d4b: u64 = d4 + c3;
+    let c4: u64 = d4b >> (26 as u64);
+    h4 = (d4b & mask26_64) as u32;
+    h0 = h0 + ((c4 as u32) * (5 as u32));
+    let c5: u32 = h0 >> (26 as u32);
+    h0 = h0 & mask26;
+    h1 = h1 + c5;
+
+    blk = blk + 1;
+  }
+
+  if leftover > 0 {
+    let z: i64 = 0;
+    while z < 16 {
+      let _ = buf_write_byte(block_scratch, z as u32, 0 as u32);
+      z = z + 1;
+    }
+    let k: i64 = 0;
+    while k < leftover {
+      let b: u32 = buf_read_byte(msg, (full_blocks * 16 + k) as u32);
+      let _ = buf_write_byte(block_scratch, k as u32, b);
+      k = k + 1;
+    }
+    let _ = buf_write_byte(block_scratch, leftover as u32, 1 as u32);
+
+    h0 = h0 + (poly1305_read_u32_le(block_scratch, 0) & mask26);
+    h1 = h1 + ((poly1305_read_u32_le(block_scratch, 3) >> (2 as u32)) & mask26);
+    h2 = h2 + ((poly1305_read_u32_le(block_scratch, 6) >> (4 as u32)) & mask26);
+    h3 = h3 + ((poly1305_read_u32_le(block_scratch, 9) >> (6 as u32)) & mask26);
+    h4 = h4 + (poly1305_read_u32_le(block_scratch, 12) >> (8 as u32)); // hibit = 0 -- the 0x01 marker byte just written IS the high bit, already inside these 16 bytes
+
+    let d0: u64 = ((h0 as u64) * (r0 as u64)) + ((h1 as u64) * (s4 as u64)) + ((h2 as u64) * (s3 as u64)) + ((h3 as u64) * (s2 as u64)) + ((h4 as u64) * (s1 as u64));
+    let d1: u64 = ((h0 as u64) * (r1 as u64)) + ((h1 as u64) * (r0 as u64)) + ((h2 as u64) * (s4 as u64)) + ((h3 as u64) * (s3 as u64)) + ((h4 as u64) * (s2 as u64));
+    let d2: u64 = ((h0 as u64) * (r2 as u64)) + ((h1 as u64) * (r1 as u64)) + ((h2 as u64) * (r0 as u64)) + ((h3 as u64) * (s4 as u64)) + ((h4 as u64) * (s3 as u64));
+    let d3: u64 = ((h0 as u64) * (r3 as u64)) + ((h1 as u64) * (r2 as u64)) + ((h2 as u64) * (r1 as u64)) + ((h3 as u64) * (r0 as u64)) + ((h4 as u64) * (s4 as u64));
+    let d4: u64 = ((h0 as u64) * (r4 as u64)) + ((h1 as u64) * (r3 as u64)) + ((h2 as u64) * (r2 as u64)) + ((h3 as u64) * (r1 as u64)) + ((h4 as u64) * (r0 as u64));
+
+    let mask26_64: u64 = 0x3ffffff as u64;
+    let c0: u64 = d0 >> (26 as u64);
+    h0 = (d0 & mask26_64) as u32;
+    let d1b: u64 = d1 + c0;
+    let c1: u64 = d1b >> (26 as u64);
+    h1 = (d1b & mask26_64) as u32;
+    let d2b: u64 = d2 + c1;
+    let c2: u64 = d2b >> (26 as u64);
+    h2 = (d2b & mask26_64) as u32;
+    let d3b: u64 = d3 + c2;
+    let c3: u64 = d3b >> (26 as u64);
+    h3 = (d3b & mask26_64) as u32;
+    let d4b: u64 = d4 + c3;
+    let c4: u64 = d4b >> (26 as u64);
+    h4 = (d4b & mask26_64) as u32;
+    h0 = h0 + ((c4 as u32) * (5 as u32));
+    let c5: u32 = h0 >> (26 as u32);
+    h0 = h0 & mask26;
+    h1 = h1 + c5;
+  }
+
+  // Fully carry h.
+  let fc1: u32 = h1 >> (26 as u32);
+  h1 = h1 & mask26;
+  h2 = h2 + fc1;
+  let fc2: u32 = h2 >> (26 as u32);
+  h2 = h2 & mask26;
+  h3 = h3 + fc2;
+  let fc3: u32 = h3 >> (26 as u32);
+  h3 = h3 & mask26;
+  h4 = h4 + fc3;
+  let fc4: u32 = h4 >> (26 as u32);
+  h4 = h4 & mask26;
+  h0 = h0 + (fc4 * (5 as u32));
+  let fc5: u32 = h0 >> (26 as u32);
+  h0 = h0 & mask26;
+  h1 = h1 + fc5;
+
+  // Compute h + -p (p = 2^130 - 5); select h if h < p, else h + -p --
+  // branchless via a mask derived from g4's own top bit, same
+  // technique as the reference algorithm (avoids branching on
+  // secret-shaped data).
+  let g0: u32 = h0 + (5 as u32);
+  let gc0: u32 = g0 >> (26 as u32);
+  let g0m: u32 = g0 & mask26;
+  let g1: u32 = h1 + gc0;
+  let gc1: u32 = g1 >> (26 as u32);
+  let g1m: u32 = g1 & mask26;
+  let g2: u32 = h2 + gc1;
+  let gc2: u32 = g2 >> (26 as u32);
+  let g2m: u32 = g2 & mask26;
+  let g3: u32 = h3 + gc2;
+  let gc3: u32 = g3 >> (26 as u32);
+  let g3m: u32 = g3 & mask26;
+  let g4: u32 = wrapping_sub(h4 + gc3, 67108864 as u32); // - (1 << 26); the intentional wraparound (h+gc3 is almost always < 2^26) is what produces the "borrow" signal the mask below reads via the top bit
+
+  let select_mask: u32 = wrapping_sub((g4 >> (31 as u32)), 1 as u32); // all-1s if g4's top bit is 0 (h>=p, use g), all-0s if top bit is 1 (h<p, use h)
+  let keep_g: u32 = select_mask;
+  let keep_h: u32 = wrapping_sub(0 as u32, 1 as u32) ^ select_mask; // bitwise NOT of select_mask
+  h0 = (h0 & keep_h) | (g0m & keep_g);
+  h1 = (h1 & keep_h) | (g1m & keep_g);
+  h2 = (h2 & keep_h) | (g2m & keep_g);
+  h3 = (h3 & keep_h) | (g3m & keep_g);
+  h4 = (h4 & keep_h) | (g4 & keep_g);
+
+  // h mod 2^128, repacked from five 26-bit limbs into four 32-bit words.
+  let out_h0: u32 = h0 | (h1 << (26 as u32));
+  let out_h1: u32 = (h1 >> (6 as u32)) | (h2 << (20 as u32));
+  let out_h2: u32 = (h2 >> (12 as u32)) | (h3 << (14 as u32));
+  let out_h3: u32 = (h3 >> (18 as u32)) | (h4 << (8 as u32));
+
+  // mac = (h + pad) mod 2^128, computed via u64 widening for the
+  // carry chain.
+  let f0: u64 = (out_h0 as u64) + (pad0 as u64);
+  let m0: u32 = f0 as u32;
+  let carry0: u64 = f0 >> (32 as u64);
+  let f1: u64 = (out_h1 as u64) + (pad1 as u64) + carry0;
+  let m1: u32 = f1 as u32;
+  let carry1: u64 = f1 >> (32 as u64);
+  let f2: u64 = (out_h2 as u64) + (pad2 as u64) + carry1;
+  let m2: u32 = f2 as u32;
+  let carry2: u64 = f2 >> (32 as u64);
+  let f3: u64 = (out_h3 as u64) + (pad3 as u64) + carry2;
+  let m3: u32 = f3 as u32;
+
+  let _ = poly1305_write_u32_le(out_tag, 0, m0);
+  let _ = poly1305_write_u32_le(out_tag, 4, m1);
+  let _ = poly1305_write_u32_le(out_tag, 8, m2);
+  let _ = poly1305_write_u32_le(out_tag, 12, m3);
+  return 0;
+}
+
+// Constant-time tag comparison -- deliberately never short-circuits on
+// the first mismatched byte (a naive early-exit compare is a real,
+// documented timing side-channel for MAC verification). n is a public
+// length (always 16 for Poly1305), never secret-dependent, so the
+// loop bound itself leaks nothing.
+fn poly1305_verify_constant_time(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let diff: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < n {
+    let ai: u32 = buf_read_byte(a, i as u32);
+    let bi: u32 = buf_read_byte(b, i as u32);
+    diff = diff | (ai ^ bi);
+    i = i + 1;
+  }
+  if diff == (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+// ---- ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) ----
+
+// out = a 64-bit little-endian length field -- shared by both of the
+// AEAD's own 8-byte length fields below.
+fn aead_write_le64(buf: mut ref i64, off: i64, v: i64) -> i64 {
+  let vu: u64 = v as u64;
+  let i: i64 = 0;
+  while i < 8 {
+    let b: u32 = ((vu >> ((i * 8) as u64)) & (255 as u64)) as u32;
+    let _ = buf_write_byte(buf, (off + i) as u32, b);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Builds RFC 8439 section 2.8's own mac_data = aad || pad16(aad) ||
+// data || pad16(data) || len(aad) as 8-byte LE || len(data) as
+// 8-byte LE into `out`, returning its total length.
+fn chacha20_poly1305_build_mac_data(aad: mut ref i64, aad_len: i64, data: mut ref i64, data_len: i64, out: mut ref i64) -> i64 {
+  let pos: i64 = 0;
+  let i: i64 = 0;
+  while i < aad_len {
+    let _ = buf_write_byte(out, pos as u32, buf_read_byte(aad, i as u32));
+    pos = pos + 1;
+    i = i + 1;
+  }
+  let aad_pad: i64 = (16 - (aad_len % 16)) % 16;
+  let j: i64 = 0;
+  while j < aad_pad {
+    let _ = buf_write_byte(out, pos as u32, 0 as u32);
+    pos = pos + 1;
+    j = j + 1;
+  }
+  let k: i64 = 0;
+  while k < data_len {
+    let _ = buf_write_byte(out, pos as u32, buf_read_byte(data, k as u32));
+    pos = pos + 1;
+    k = k + 1;
+  }
+  let data_pad: i64 = (16 - (data_len % 16)) % 16;
+  let m: i64 = 0;
+  while m < data_pad {
+    let _ = buf_write_byte(out, pos as u32, 0 as u32);
+    pos = pos + 1;
+    m = m + 1;
+  }
+  let _ = aead_write_le64(out, pos, aad_len);
+  pos = pos + 8;
+  let _ = aead_write_le64(out, pos, data_len);
+  pos = pos + 8;
+  return pos;
+}
+
+// Encrypts `plaintext` with ChaCha20-Poly1305, key/nonce per RFC 8439,
+// producing `out_ciphertext` (same length as plaintext) and a 16-byte
+// `out_tag`. state_buf/working_buf/keystream_buf are chacha20_block's
+// own scratch shape; block_scratch is poly1305_mac's own; otk_scratch
+// (32B) and mac_data_scratch (caller-sized: aad_len + data_len +
+// padding + 16, rounded up) are this function's own.
+fn chacha20_poly1305_encrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_len: i64,
+                              plaintext: mut ref i64, plaintext_len: i64,
+                              state_buf: mut ref i64, working_buf: mut ref i64, keystream_buf: mut ref i64,
+                              block_scratch: mut ref i64, otk_scratch: mut ref i64, mac_data_scratch: mut ref i64,
+                              out_ciphertext: mut ref i64, out_tag: mut ref i64) -> i64 {
+  let _ = chacha20_block(key, 0 as u32, nonce, state_buf, working_buf, keystream_buf);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(otk_scratch, i as u32, buf_read_byte(keystream_buf, i as u32));
+    i = i + 1;
+  }
+
+  let _ = chacha20_encrypt(key, nonce, 1 as u32, plaintext, plaintext_len, state_buf, working_buf, keystream_buf, out_ciphertext);
+
+  let mac_len: i64 = chacha20_poly1305_build_mac_data(aad, aad_len, out_ciphertext, plaintext_len, mac_data_scratch);
+  let _ = poly1305_mac(otk_scratch, mac_data_scratch, mac_len, block_scratch, out_tag);
+  return 0;
+}
+
+// Verifies `tag_in` (16 bytes) against `ciphertext`/`aad`, and if (and
+// only if) it matches, decrypts into `out_plaintext`. Returns 0 on
+// success, -1 on a tag mismatch (out_plaintext is left untouched --
+// "reject, don't guess": a caller must never act on decrypted data
+// from a call that returned -1).
+fn chacha20_poly1305_decrypt(key: mut ref i64, nonce: mut ref i64, aad: mut ref i64, aad_len: i64,
+                              ciphertext: mut ref i64, ciphertext_len: i64, tag_in: mut ref i64,
+                              state_buf: mut ref i64, working_buf: mut ref i64, keystream_buf: mut ref i64,
+                              block_scratch: mut ref i64, otk_scratch: mut ref i64, mac_data_scratch: mut ref i64,
+                              computed_tag_scratch: mut ref i64, out_plaintext: mut ref i64) -> i64 {
+  let _ = chacha20_block(key, 0 as u32, nonce, state_buf, working_buf, keystream_buf);
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(otk_scratch, i as u32, buf_read_byte(keystream_buf, i as u32));
+    i = i + 1;
+  }
+
+  let mac_len: i64 = chacha20_poly1305_build_mac_data(aad, aad_len, ciphertext, ciphertext_len, mac_data_scratch);
+  let _ = poly1305_mac(otk_scratch, mac_data_scratch, mac_len, block_scratch, computed_tag_scratch);
+
+  if poly1305_verify_constant_time(computed_tag_scratch, tag_in, 16) == 0 {
+    return 0 - 1;
+  }
+
+  let _ = chacha20_encrypt(key, nonce, 1 as u32, ciphertext, ciphertext_len, state_buf, working_buf, keystream_buf, out_plaintext);
+  return 0;
+}

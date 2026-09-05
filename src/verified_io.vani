@@ -1,0 +1,162 @@
+// DharaFS verified I/O: opt-in, stronger integrity for security-
+// critical paths, on top of core.vani's own per-record checksum
+// (which catches torn/partial writes but isn't collision-resistant
+// and can't meaningfully catch deliberate tampering).
+//
+// Ported from Dhruva OS's own kernel/kernel_main.vani (round 48).
+// Wired in WITHOUT touching the 512-byte on-disk record format at
+// all: the digest for `path` lives in its own ordinary DharaFS file
+// at `path` + ".sha256" -- a companion record using the same existing
+// primitives, no format change. A path already at the 32-byte cap has
+// no room left for a 7-byte ".sha256" companion path --
+// dharafs_verified_companion_path_raw (core.vani) reports that
+// explicitly (-1) rather than silently truncating or colliding with
+// an unrelated path.
+//
+// Composes independently of media_crypto.vani: this operates at the
+// FS layer (whole-file digests over plaintext), media encryption
+// operates at the raw block layer below dharafs_block_read/write --
+// either can be linked without the other, and using both together
+// works exactly as you'd expect (the verified digest is computed over
+// the same plaintext bytes a caller reads/writes either way; media
+// encryption is transparent to this layer, same as it is to every
+// other core.vani function). See test/host_test_tier2.vani for a
+// test exercising both together.
+
+use "./crypto.vani";
+use "./core.vani";
+
+extern "C" fn dharafs_verified_companion_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_verified_digest_a_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_verified_digest_b_scratch_get() -> mut ref i64;
+
+// Writes `path` normally, then a SHA-256 digest of its data under the
+// companion path above. Both writes use the given owner/mode -- the
+// digest record is never independently owner/permission-managed, it
+// always mirrors whatever the data file it protects has.
+fn dharafs_write_verified_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  let companion_buf: mut ref i64 = dharafs_verified_companion_scratch_get();
+  let companion_len: i64 = dharafs_verified_companion_path_raw(path_buf, path_len, companion_buf);
+  if companion_len < 0 {
+    // -1 is otherwise unused by the write path (dharafs_write_raw_checked's
+    // own convention has no "not found" case -- any path is writable),
+    // so it's free to mean "path too long for a companion digest" here
+    // specifically, distinct from a generic write failure (1).
+    return 0 - 1;
+  }
+  let write_status: i64 = dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+  if write_status != 0 {
+    return write_status;
+  }
+  let digest: mut ref i64 = dharafs_verified_digest_a_scratch_get();
+  let _ = sha256_hash(data_buf, data_len, digest);
+  return dharafs_append_raw(companion_buf, companion_len, digest, 32, owner_uid, owner_gid, mode);
+}
+
+// Permission-enforcing entry point -- identical preserve-on-overwrite
+// and write-permission logic to dharafs_write_raw_checked, just also
+// carrying the digest write through dharafs_write_verified_raw above.
+fn dharafs_write_verified_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { req_uid };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { req_gid };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
+  if stat_status == 0 {
+    let attr_status: i64 = dharafs_attr_check_write(path_buf, path_len, data_buf, data_len, mode);
+    if attr_status != 0 {
+      return attr_status;
+    }
+    let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+    if allowed == 0 {
+      return 0 - 2;
+    }
+  }
+  return dharafs_write_verified_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+// Reads `path` (permission-checked, same as dharafs_read_raw_checked)
+// then, if a companion digest was ever written for it, recomputes
+// SHA-256 over the data just read and compares. Return convention
+// extends dharafs_read_raw_checked's own (-1 not found, -2 permission
+// denied, else data length) with one more case: -3 means the read
+// itself succeeded but the companion digest exists and does NOT
+// match -- tamper or corruption beyond what the per-block checksum
+// alone catches. No companion digest at all is NOT an error --
+// verification is opt-in per path, so that case just returns the
+// plain data length, same as an unverified read.
+fn dharafs_read_verified_checked(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64, req_uid: u32, req_gid: u32) -> i64 {
+  let data_len: i64 = dharafs_read_raw_checked(path_buf, path_len, out_buf, req_uid, req_gid);
+  if data_len < 0 {
+    return data_len;
+  }
+  let companion_buf: mut ref i64 = dharafs_verified_companion_scratch_get();
+  let companion_len: i64 = dharafs_verified_companion_path_raw(path_buf, path_len, companion_buf);
+  if companion_len < 0 {
+    return data_len;
+  }
+  let stored_digest: mut ref i64 = dharafs_verified_digest_b_scratch_get();
+  // Unchecked read of the companion digest -- the caller already
+  // passed the real permission check on the DATA file above, and
+  // nothing in this package ever gives the sidecar digest record a
+  // different owner/mode than the file it protects.
+  let digest_len: i64 = dharafs_read_raw(companion_buf, companion_len, stored_digest);
+  if digest_len != 32 {
+    return data_len; // no companion digest was ever written for this path
+  }
+  let computed_digest: mut ref i64 = dharafs_verified_digest_a_scratch_get();
+  let _ = sha256_hash(out_buf, data_len, computed_digest);
+  let matches: i64 = sha256_bytes_equal(stored_digest, computed_digest, 32);
+  if matches == 0 {
+    return 0 - 3;
+  }
+  return data_len;
+}
+
+// Str-based convenience wrappers, matching core.vani's own
+// dharafs_append/dharafs_read shape: copy into the shared path
+// scratch, run the current user's uid/gid through the checked entry
+// points above.
+fn dharafs_write_verified(path: Str, data: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  if path_len <= 0 {
+    return 1;
+  }
+  if path_len > 32 {
+    return 1;
+  }
+  if data_len > dharafs_file_max_len() {
+    return 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < data_len {
+    let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_write_verified_checked(path_buf, path_len, data_buf, data_len, dharafs_user_get_uid(), dharafs_user_get_gid());
+}
+
+fn dharafs_read_verified(path: Str, out_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len <= 0 {
+    return 0 - 1;
+  }
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_read_verified_checked(path_buf, path_len, out_buf, dharafs_user_get_uid(), dharafs_user_get_gid());
+}

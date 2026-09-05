@@ -1,0 +1,15 @@
+// DharaFS -- core filesystem + real SHA-256-verified companion-file
+// I/O, WITHOUT media encryption (the media-encryption hook stays a
+// consumer-provided extern, same contract as Tier 1's src/lib.vani).
+// Link: runtime/dharafs_runtime.c, runtime/dharafs_crypto_runtime.c,
+// runtime/dharafs_verified_io_runtime.c, plus your own stub for the
+// three dharafs_crypto_* hook functions (see test/host_stubs.c).
+
+use "./core.vani";
+use "./crypto.vani";
+use "./verified_io.vani";
+
+// Media-encryption hook -- OPTIONAL, same contract as src/lib.vani.
+extern "C" fn dharafs_crypto_get_enabled() -> u32;
+extern "C" fn dharafs_crypto_encrypt_block(block_num: i64, plaintext: mut ref i64, out_ciphertext: mut ref i64) -> i64;
+extern "C" fn dharafs_crypto_decrypt_block(block_num: i64, ciphertext: mut ref i64, out_plaintext: mut ref i64) -> i64;

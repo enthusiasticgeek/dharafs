@@ -1,0 +1,14 @@
+// Raw byte/word access into a `mut ref i64` -- vani has no built-in
+// way to do this directly. Mechanical, zero OS dependency -- provided
+// by runtime/dharafs_runtime.c. Shared by core.vani and crypto.vani
+// (both `use` this file rather than declaring these directly) so a
+// program combining both (src/lib_tier2.vani and friends) doesn't hit
+// vani's "function already defined" duplicate-declaration check --
+// `use` deduplicates by resolved file path, so this file is only ever
+// processed once regardless of how many other files pull it in.
+
+extern "C" fn buf_read_byte(buf: mut ref i64, offset: u32) -> u32;
+extern "C" fn buf_write_byte(buf: mut ref i64, offset: u32, value: u32) -> u32;
+extern "C" fn buf_read_u32(buf: mut ref i64, offset: u32) -> u32;
+extern "C" fn buf_write_u32(buf: mut ref i64, offset: u32, value: u32) -> u32;
+extern "C" fn buf_checksum(buf: mut ref i64, start_offset: u32, byte_len: u32) -> u32;

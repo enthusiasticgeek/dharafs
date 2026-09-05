@@ -1,0 +1,2473 @@
+// DharaFS core: log-structured, append-only filesystem logic (record
+// format, checksums, journaling, permissions, directories, the hashed
+// directory index, snapshots). This file does NOT declare the three
+// media-encryption hook functions (dharafs_crypto_get_enabled/
+// _encrypt_block/_decrypt_block) -- see src/lib.vani (Tier 1: declares
+// them extern, a consumer-pluggable hook) and src/lib_tier2.vani
+// (Tier 2: use "./media_crypto.vani" instead, providing a real
+// ChaCha20-Poly1305 AEAD implementation) for the two ways to complete
+// this file into an actual compilable program. Splitting the hook
+// declaration out of this file is what makes both tiers possible from
+// one shared codebase: vani's flat, whole-program name resolution
+// rejects a real `fn` definition and an `extern "C" fn` declaration of
+// the same name coexisting, so core FS logic (used by both tiers)
+// cannot itself commit to either answer.
+//
+// Extracted from Dhruva OS (https://github.com/enthusiasticgeek/dhruvaos),
+// where this same source has run under extensive regression testing
+// (real-hardware-shaped SD card round trips, a 70/70 simulated-power-
+// loss torn-write sweep, ASAN/UBSAN-clean host-process runs) across
+// many rounds of development. See docs/DHARAFS_PORTABILITY.md in that
+// repository for the full scoping analysis this extraction is based
+// on -- this file is every dharafs_* function EXCEPT the priority-aware
+// FS request queue (dharafs_queue_*), the one piece of DhruvaOS-specific
+// functionality with a genuine scheduler dependency (current_eff_prio/
+// current_task_get) this package deliberately does not carry.
+//
+// ON-DISK FORMAT: fixed 512-byte records, raw block numbers, a
+// checksum + monotonic sequence number per record, log-structured
+// (every write appends, nothing is ever modified in place). See
+// README.md for the full record layout and API reference.
+//
+// WHAT A CONSUMER MUST PROVIDE (extern "C" functions this file calls
+// but does not implement -- see README.md for the full contract):
+//   - Block I/O:  dharafs_backend_read_block / _write_block
+//   - Allocator:  dharafs_alloc_bytes
+//   - Logging:    dharafs_log_puts / _putc / _put_hex32
+//   - ~90 mechanical scratch-buffer/state-table accessors (pure
+//     get/set one-liners -- a workaround for vani not having
+//     persistent top-level state holding buffer pointers). A
+//     reference, fully portable C implementation of every one of
+//     these ships in this package's own runtime/dharafs_runtime.c --
+//     most consumers should just compile and link that file directly
+//     rather than reimplementing this layer themselves.
+//
+// WHAT THIS FILE DOES NOT INCLUDE, ON PURPOSE:
+//   - The priority-aware FS request queue (dharafs_queue_*) -- real
+//     scheduler dependency, DhruvaOS-specific, see TODO.md.
+//   - Any actual crypto algorithm implementation (ChaCha20-Poly1305,
+//     SHA-256, PBKDF2, ...) -- see src/crypto.vani (Tier 2) for that.
+
+// Buffer primitives -- shared with crypto.vani via its own file
+// rather than declared here directly, so a program `use`-ing both
+// this file and crypto.vani (src/lib_tier2.vani and friends) doesn't
+// hit a duplicate-declaration error (`use` deduplicates by resolved
+// file path, so buf_primitives.vani is only ever processed once).
+use "./buf_primitives.vani";
+
+extern "C" fn dharafs_backend_read_block(block_num: i64, buf: mut ref i64) -> i64;
+extern "C" fn dharafs_backend_write_block(block_num: i64, buf: mut ref i64) -> i64;
+extern "C" fn dharafs_alloc_bytes(n: i64) -> mut ref i64;
+extern "C" fn dharafs_log_puts(s: Str) -> i64;
+extern "C" fn dharafs_log_putc(c: i64) -> i64;
+extern "C" fn dharafs_log_put_hex32(v: u32) -> i64;
+
+// The media-encryption hook itself (dharafs_crypto_get_enabled/
+// _encrypt_block/_decrypt_block) is declared by whichever entry file
+// completes this one -- see this file's own header comment. This
+// scratch-buffer accessor is mechanical (not a hook), needed by
+// dharafs_block_read/write below regardless of which tier provides
+// the hook, so it lives here rather than in either entry file.
+extern "C" fn dharafs_crypto_scratch_ptr() -> mut ref i64;
+
+extern "C" fn test_fill_pattern(buf: mut ref i64, byte_count: i64) -> i64;
+extern "C" fn test_compare_buffers(a: mut ref i64, b: mut ref i64, byte_count: i64) -> i64;
+
+// Core filesystem state (next_block/next_seq/log_start, the
+// currently-active uid/gid, a running commit counter) -- mechanical,
+// provided by runtime/dharafs_runtime.c.
+extern "C" fn dharafs_state_get_next_block() -> u32;
+extern "C" fn dharafs_state_get_next_seq() -> u32;
+extern "C" fn dharafs_state_get_log_start() -> u32;
+extern "C" fn dharafs_state_set(next_block: u32, next_seq: u32) -> u32;
+extern "C" fn dharafs_state_set_log_start(log_start: u32) -> u32;
+extern "C" fn dharafs_user_get_uid() -> u32;
+extern "C" fn dharafs_user_get_gid() -> u32;
+extern "C" fn dharafs_user_set(uid: u32, gid: u32) -> u32;
+extern "C" fn dharafs_commit_count_increment() -> u32;
+
+// Scratch buffers (mechanical, provided by runtime/dharafs_runtime.c).
+extern "C" fn dharafs_sd_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_path_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_data_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_stat_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_dir_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_path_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_header_path_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_header_data_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_existing_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_log_combined_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_appendonly_check_scratch_get() -> mut ref i64;
+extern "C" fn dharafs_rename_new_path_scratch_get() -> mut ref i64;
+
+// Hashed directory index -- a pure O(1)-lookup accelerator for
+// dharafs_find_latest_block_raw with a GUARANTEED-correct fallback (a
+// miss just means the same full log scan this function always did),
+// so it's safe to include unconditionally rather than needing to be
+// cut for a "minimal" consumer. Fixed-size table, mechanical,
+// provided by runtime/dharafs_runtime.c.
+extern "C" fn dirindex_get_valid_at(index: u32) -> i64;
+extern "C" fn dirindex_set_valid_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_hash_at(index: u32) -> i64;
+extern "C" fn dirindex_set_hash_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_pathlen_at(index: u32) -> i64;
+extern "C" fn dirindex_set_pathlen_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_block_at(index: u32) -> i64;
+extern "C" fn dirindex_set_block_at(index: u32, value: u32) -> i64;
+extern "C" fn dirindex_get_path_byte(combined_index: u32) -> i64;
+extern "C" fn dirindex_set_path_byte(combined_index: u32, value: u32) -> i64;
+
+// Snapshots / versioned rollback -- fixed-size table, mechanical,
+// provided by runtime/dharafs_runtime.c.
+extern "C" fn snapshot_valid_get_at(index: u32) -> i64;
+extern "C" fn snapshot_valid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn snapshot_pinned_seq_get_at(index: u32) -> i64;
+extern "C" fn snapshot_pinned_seq_set_at(index: u32, value: u32) -> i64;
+extern "C" fn snapshot_name_len_get_at(index: u32) -> i64;
+extern "C" fn snapshot_name_len_set_at(index: u32, value: u32) -> i64;
+extern "C" fn snapshot_get_name_byte(combined_index: u32) -> i64;
+extern "C" fn snapshot_set_name_byte(combined_index: u32, value: u32) -> i64;
+
+// Small pure constants/helpers -- zero OS dependency, included
+// directly rather than declared extern.
+fn dirindex_max_slots() -> i64 { return 256; }
+fn dirindex_max_path_bytes() -> i64 { return 32; }
+fn snapshot_max_slots() -> i64 { return 8; }
+fn snapshot_max_name_bytes() -> i64 { return 32; }
+
+fn buf_write_u32_be(buf: mut ref i64, offset: i64, value: u32) -> i64 {
+  let b0: u32 = value & (0xFF as u32);
+  let b1: u32 = (value >> (8 as u32)) & (0xFF as u32);
+  let b2: u32 = (value >> (16 as u32)) & (0xFF as u32);
+  let b3: u32 = (value >> (24 as u32)) & (0xFF as u32);
+  let _ = buf_write_byte(buf, offset as u32, b3);
+  let _ = buf_write_byte(buf, (offset + 1) as u32, b2);
+  let _ = buf_write_byte(buf, (offset + 2) as u32, b1);
+  let _ = buf_write_byte(buf, (offset + 3) as u32, b0);
+  return 0;
+}
+
+fn buf_read_u32_be(buf: mut ref i64, offset: i64) -> u32 {
+  let b0: u32 = buf_read_byte(buf, offset as u32);
+  let b1: u32 = buf_read_byte(buf, (offset + 1) as u32);
+  let b2: u32 = buf_read_byte(buf, (offset + 2) as u32);
+  let b3: u32 = buf_read_byte(buf, (offset + 3) as u32);
+  return (b0 << (24 as u32)) | (b1 << (16 as u32)) | (b2 << (8 as u32)) | b3;
+}
+
+fn str_copy_to_buf(s: Str, out: mut ref i64) -> i64 {
+  let n: i64 = str_len_bytes(s);
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(out, i as u32, str_byte_at(s, i) as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn dharafs_block_read_raw(block_num: i64, buf: mut ref i64) -> i64 {
+  // Consumer-provided: the ONE real hardware seam. DhruvaOS itself
+  // dispatches this to SDHOST/USB-MSD/an in-memory test backend based
+  // on its own dharafs_state_get_block_dev() selector -- that 3-way
+  // dispatch is DhruvaOS-specific convenience, not something this
+  // kernel-agnostic package should hardcode. A consumer wanting
+  // multiple backends implements that behind this one function.
+  return dharafs_backend_read_block(block_num, buf);
+}
+
+fn dharafs_block_write_raw(block_num: i64, buf: mut ref i64) -> i64 {
+  let status: i64 = dharafs_backend_write_block(block_num, buf);
+  // Counts every successful commit, across whatever backend(s) the
+  // consumer's own dharafs_backend_write_block implements -- the one
+  // choke point every real FS write already passes through regardless.
+  if status == 0 {
+    let _ = dharafs_commit_count_increment();
+  }
+  return status;
+}
+
+fn dharafs_block_read(block_num: i64, buf: mut ref i64) -> i64 {
+  if dharafs_crypto_get_enabled() == (1 as u32) {
+    let scratch: mut ref i64 = dharafs_crypto_scratch_ptr();
+    let status: i64 = dharafs_block_read_raw(block_num, scratch);
+    if status != 0 {
+      return status;
+    }
+    return dharafs_crypto_decrypt_block(block_num, scratch, buf);
+  }
+  return dharafs_block_read_raw(block_num, buf);
+}
+
+fn dharafs_block_write(block_num: i64, buf: mut ref i64) -> i64 {
+  if dharafs_crypto_get_enabled() == (1 as u32) {
+    let scratch: mut ref i64 = dharafs_crypto_scratch_ptr();
+    let _ = dharafs_crypto_encrypt_block(block_num, buf, scratch);
+    return dharafs_block_write_raw(block_num, scratch);
+  }
+  return dharafs_block_write_raw(block_num, buf);
+}
+
+fn dharafs_block_payload_cap() -> i64 {
+  return 448;
+}
+
+fn dharafs_file_max_len() -> i64 {
+  return 4096;
+}
+
+fn dharafs_default_mode() -> u32 {
+  return 0x1A4 as u32;
+}
+
+fn dharafs_check_permission(owner_uid: u32, owner_gid: u32, mode: u32, req_uid: u32, req_gid: u32, want_read: i64, want_write: i64, _want_exec: i64) -> i64 {
+  if req_uid == (0 as u32) {
+    return 1;
+  }
+  let shift: u32 = if req_uid == owner_uid {
+    6 as u32
+  } else {
+    if req_gid == owner_gid { 3 as u32 } else { 0 as u32 }
+  };
+  let bit: u32 = if want_read == 1 {
+    (4 as u32) << shift
+  } else {
+    if want_write == 1 { (2 as u32) << shift } else { (1 as u32) << shift }
+  };
+  if (mode & bit) != (0 as u32) {
+    return 1;
+  }
+  return 0;
+}
+
+fn dharafs_dirindex_reset() -> i64 {
+  let i: i64 = 0;
+  while i < dirindex_max_slots() {
+    let _ = dirindex_set_valid_at(i as u32, 0 as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn dharafs_dirindex_hash(buf: mut ref i64, path_offset: i64, path_len: i64) -> u32 {
+  let hash: u32 = 2166136261 as u32;
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = buf_read_byte(buf, (path_offset + k) as u32);
+    hash = hash ^ b;
+    hash = wrapping_mul(hash, 16777619 as u32);
+    k = k + 1;
+  }
+  return hash;
+}
+
+fn dharafs_dirindex_path_matches(slot: i64, buf: mut ref i64, path_offset: i64, path_len: i64) -> i64 {
+  if dirindex_get_pathlen_at(slot as u32) != path_len {
+    return 0;
+  }
+  let k: i64 = 0;
+  let matches: i64 = 1;
+  while k < path_len {
+    let want: u32 = buf_read_byte(buf, (path_offset + k) as u32);
+    let got: u32 = dirindex_get_path_byte((slot * dirindex_max_path_bytes() + k) as u32) as u32;
+    if got != want {
+      matches = 0;
+    }
+    k = k + 1;
+  }
+  return matches;
+}
+
+fn dharafs_dirindex_find_slot(buf: mut ref i64, path_offset: i64, path_len: i64, h: u32) -> i64 {
+  let start: i64 = (h % (dirindex_max_slots() as u32)) as i64;
+  let i: i64 = 0;
+  while i < dirindex_max_slots() {
+    let idx: i64 = (start + i) % dirindex_max_slots();
+    if dirindex_get_valid_at(idx as u32) == 0 {
+      return 0 - 1;
+    }
+    if (dirindex_get_hash_at(idx as u32) as u32) == h {
+      if dharafs_dirindex_path_matches(idx, buf, path_offset, path_len) == 1 {
+        return idx;
+      }
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn dharafs_dirindex_lookup_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  let h: u32 = dharafs_dirindex_hash(path_buf, 0, path_len);
+  let slot: i64 = dharafs_dirindex_find_slot(path_buf, 0, path_len, h);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  return dirindex_get_block_at(slot as u32);
+}
+
+fn dharafs_dirindex_upsert(buf: mut ref i64, path_offset: i64, path_len: i64, block: i64) -> i64 {
+  let h: u32 = dharafs_dirindex_hash(buf, path_offset, path_len);
+  let existing: i64 = dharafs_dirindex_find_slot(buf, path_offset, path_len, h);
+  if existing >= 0 {
+    let _ = dirindex_set_block_at(existing as u32, block as u32);
+    return 0;
+  }
+  let start: i64 = (h % (dirindex_max_slots() as u32)) as i64;
+  let i: i64 = 0;
+  while i < dirindex_max_slots() {
+    let idx: i64 = (start + i) % dirindex_max_slots();
+    if dirindex_get_valid_at(idx as u32) == 0 {
+      let _ = dirindex_set_valid_at(idx as u32, 1 as u32);
+      let _ = dirindex_set_hash_at(idx as u32, h);
+      let _ = dirindex_set_pathlen_at(idx as u32, path_len as u32);
+      let k: i64 = 0;
+      while k < path_len {
+        let b: u32 = buf_read_byte(buf, (path_offset + k) as u32);
+        let _ = dirindex_set_path_byte((idx * dirindex_max_path_bytes() + k) as u32, b);
+        k = k + 1;
+      }
+      let _ = dirindex_set_block_at(idx as u32, block as u32);
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0 - 1; // table full -- see this fn's own doc comment above
+}
+
+fn dharafs_dirindex_upsert_raw(path_buf: mut ref i64, path_len: i64, block: i64) -> i64 {
+  return dharafs_dirindex_upsert(path_buf, 0, path_len, block);
+}
+
+fn dharafs_init() -> i64 {
+  let _ = dharafs_dirindex_reset();
+  let _ = dharafs_snapshot_reset();
+  let buf: mut ref i64 = dharafs_alloc_bytes(512);
+  let blk: i64 = 1;
+  let max_blk: i64 = 2048; // 1MB log region for this v1 -- keeps a
+                            // fresh/large device's recovery scan
+                            // bounded rather than reading the whole
+                            // disk looking for the first free block.
+  let highest_seq: u32 = 0 as u32;
+  while blk < max_blk {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status != 0 {
+      break;
+    }
+    let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+    let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let this_seq: u32 = buf_read_u32(buf, 4 as u32);
+    // A checksum match ALONE isn't enough: buf_checksum's rotate-mix
+    // of an all-zero region is itself exactly 0, matching the
+    // all-zero stored-checksum field a genuinely unwritten (fresh
+    // device, never appended to) block already has -- so an empty
+    // block would otherwise look like a perfectly valid, trivially
+    // empty record, and recovery would silently scan straight past
+    // every real free block instead of stopping at the first one.
+    // Every genuine record's sequence number is >= 1 (dharafs_append never
+    // hands out 0), so requiring seq_num != 0 too is what actually
+    // distinguishes "real record" from "blank space that happens to
+    // checksum-match its own all-zero checksum field." Found by the
+    // append cursor landing at block 2040 on a device where nothing
+    // had ever been written below that -- exactly where an unrelated
+    // test (task #3's SD round-trip sweep) happens to write raw,
+    // non-record data, which is what finally failed the checksum
+    // check and looked like where the log "ended."
+    if (stored_checksum != computed_checksum) || (this_seq == (0 as u32)) {
+      break;
+    }
+
+    let this_path_len: u32 = buf_read_u32(buf, 8 as u32);
+    if this_path_len == dharafs_tx_begin_sentinel() {
+      // Round 52: a transaction marker -- see dharafs_tx_begin_raw's
+      // own comment for why "are the next block_count blocks all
+      // present and checksum-valid" is a complete completion proof.
+      // buf's own contents (this_seq, block_count) are already
+      // captured into locals below before this loop starts reusing
+      // buf for each follow-up block's own read.
+      let block_count: i64 = buf_read_u32(buf, 44 as u32) as i64;
+      let tx_ok: i64 = 1;
+      let j: i64 = 1;
+      while j <= block_count {
+        let check_blk: i64 = blk + j;
+        if check_blk >= max_blk {
+          tx_ok = 0;
+        } else {
+          let rd2: i64 = dharafs_block_read(check_blk, buf);
+          if rd2 != 0 {
+            tx_ok = 0;
+          } else {
+            let sc2: u32 = buf_read_u32(buf, 0 as u32);
+            let cc2: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+            let seq2: u32 = buf_read_u32(buf, 4 as u32);
+            if (sc2 != cc2) || (seq2 == (0 as u32)) {
+              tx_ok = 0;
+            }
+          }
+        }
+        j = j + 1;
+      }
+      if tx_ok == 1 {
+        // Every block's seq is assigned sequentially (dharafs_state_
+        // set always advances by exactly the number of blocks just
+        // written), so the group's own highest seq is this_seq +
+        // block_count without needing to re-read each one.
+        highest_seq = this_seq + (block_count as u32);
+        // Index every block this confirmed-complete transaction
+        // covers -- these are real file records too (e.g. dharafs_
+        // rename's own append+tombstone pair), just as eligible for
+        // the fast lookup path as any standalone record. Re-read
+        // rather than reuse buf from the verification loop above,
+        // since that loop only left the LAST checked block's bytes
+        // in buf, not every one of them.
+        let jj: i64 = 1;
+        while jj <= block_count {
+          let idx_blk: i64 = blk + jj;
+          let rd3: i64 = dharafs_block_read(idx_blk, buf);
+          if rd3 == 0 {
+            let plen3: u32 = buf_read_u32(buf, 8 as u32);
+            let _ = dharafs_dirindex_upsert(buf, 12, plen3 as i64, idx_blk);
+          }
+          jj = jj + 1;
+        }
+        blk = blk + 1 + block_count;
+      } else {
+        // Incomplete -- stop scanning HERE, before even counting the
+        // tx_begin record itself. Nothing after this point in the log
+        // can be trusted (a crash stops everything; no further real
+        // append could have happened after an incomplete transaction
+        // within this same boot), so this is also just where the scan
+        // would need to stop anyway, not an extra restriction.
+        break;
+      }
+    } else {
+      if this_seq > highest_seq {
+        highest_seq = this_seq;
+      }
+      let _ = dharafs_dirindex_upsert(buf, 12, this_path_len as i64, blk);
+      blk = blk + 1;
+    }
+  }
+  let _ = dharafs_state_set(blk as u32, highest_seq + (1 as u32));
+  // log_start always resets to 1 on boot -- it's an in-RAM-only
+  // optimization task #5's compaction earns back within a session
+  // (fewer blocks to scan), not something persisted across reboots.
+  // Recovery has no other safe starting point to trust anyway: with
+  // nothing on the card recording where a prior compaction left off,
+  // block 1 is the only assumption that can't be wrong.
+  let _ = dharafs_state_set_log_start(1 as u32);
+  return 0;
+}
+
+fn dharafs_append_raw(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  if path_len <= 0 {
+    return 1; // reserved as the continuation-block sentinel, see
+              // dharafs_init's own header comment -- a genuine empty path
+              // is rejected outright so it can never collide with one
+  }
+  if path_len > 32 {
+    return 1;
+  }
+  if data_len > dharafs_file_max_len() {
+    return 1;
+  }
+
+  let cap: i64 = dharafs_block_payload_cap();
+  if data_len <= cap {
+    // Single block -- byte-identical in spirit to every pre-round-39
+    // record: one head block, next_block=0.
+    let buf: mut ref i64 = dharafs_sd_scratch_get();
+    let next_block: u32 = dharafs_state_get_next_block();
+    let next_seq: u32 = dharafs_state_get_next_seq();
+
+    let _ = buf_write_u32(buf, 4 as u32, next_seq);
+    let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+    let i: i64 = 0;
+    while i < path_len {
+      let b: u32 = buf_read_byte(path_buf, i as u32);
+      let _ = buf_write_byte(buf, (12 + i) as u32, b);
+      i = i + 1;
+    }
+    let _ = buf_write_u32(buf, 44 as u32, data_len as u32);
+    let _ = buf_write_u32(buf, 48 as u32, 0 as u32); // next_block: none
+    let _ = buf_write_u32(buf, 52 as u32, owner_uid);
+    let _ = buf_write_u32(buf, 56 as u32, owner_gid);
+    let _ = buf_write_u32(buf, 60 as u32, mode);
+    let j: i64 = 0;
+    while j < data_len {
+      let b2: u32 = buf_read_byte(data_buf, j as u32);
+      let _ = buf_write_byte(buf, (64 + j) as u32, b2);
+      j = j + 1;
+    }
+
+    // Checksum last, over everything written above -- covers exactly
+    // what a torn write could have left half-updated.
+    let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+    let wr_status: i64 = dharafs_block_write(next_block as i64, buf);
+    if wr_status != 0 {
+      return 1;
+    }
+
+    let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
+    return 0;
+  }
+
+  // Multi-block: split into ceil(data_len/cap) chunks, block numbers
+  // and sequence numbers allocated up front (chunk i lands at
+  // base_block+i regardless of write order), then WRITTEN IN REVERSE
+  // -- every continuation chunk first, the head block last -- so the
+  // head's own single-block write is the one atomic point at which
+  // the whole chain becomes reachable at all. See dharafs_init's own header
+  // comment for the full crash-consistency reasoning.
+  let num_chunks: i64 = (data_len + cap - 1) / cap;
+  let base_block: u32 = dharafs_state_get_next_block();
+  let base_seq: u32 = dharafs_state_get_next_seq();
+
+  let chunk_idx: i64 = num_chunks - 1;
+  while chunk_idx >= 0 {
+    let this_block: u32 = base_block + (chunk_idx as u32);
+    let this_seq: u32 = base_seq + (chunk_idx as u32);
+    let is_head: i64 = if chunk_idx == 0 { 1 } else { 0 };
+    let chunk_offset: i64 = chunk_idx * cap;
+    let remaining_from_here: i64 = data_len - chunk_offset;
+    let chunk_len: i64 = if remaining_from_here < cap { remaining_from_here } else { cap };
+    let is_last_chunk: i64 = if chunk_idx == (num_chunks - 1) { 1 } else { 0 };
+    let next_block_field: u32 = if is_last_chunk == 1 { 0 as u32 } else { base_block + ((chunk_idx + 1) as u32) };
+
+    let buf: mut ref i64 = dharafs_sd_scratch_get();
+    let _ = buf_write_u32(buf, 4 as u32, this_seq);
+    if is_head == 1 {
+      let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+      let i: i64 = 0;
+      while i < path_len {
+        let b: u32 = buf_read_byte(path_buf, i as u32);
+        let _ = buf_write_byte(buf, (12 + i) as u32, b);
+        i = i + 1;
+      }
+      let _ = buf_write_u32(buf, 44 as u32, data_len as u32); // TOTAL length
+      let _ = buf_write_u32(buf, 52 as u32, owner_uid);
+      let _ = buf_write_u32(buf, 56 as u32, owner_gid);
+      let _ = buf_write_u32(buf, 60 as u32, mode);
+    } else {
+      let _ = buf_write_u32(buf, 8 as u32, 0 as u32); // continuation marker
+      let z: i64 = 0;
+      while z < 32 {
+        let _ = buf_write_byte(buf, (12 + z) as u32, 0 as u32);
+        z = z + 1;
+      }
+      let _ = buf_write_u32(buf, 44 as u32, chunk_len as u32); // THIS chunk's own length
+      let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+      let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+      let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
+    }
+    let _ = buf_write_u32(buf, 48 as u32, next_block_field);
+    let j: i64 = 0;
+    while j < chunk_len {
+      let b2: u32 = buf_read_byte(data_buf, (chunk_offset + j) as u32);
+      let _ = buf_write_byte(buf, (64 + j) as u32, b2);
+      j = j + 1;
+    }
+
+    let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+    let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+    let wr_status: i64 = dharafs_block_write(this_block as i64, buf);
+    if wr_status != 0 {
+      // Stop without advancing state -- the next real append reuses
+      // base_block and overwrites whatever partial chain was left,
+      // same "state only advances on full success" posture as the
+      // single-block path above.
+      return 1;
+    }
+    chunk_idx = chunk_idx - 1;
+  }
+
+  let _ = dharafs_state_set(base_block + (num_chunks as u32), base_seq + (num_chunks as u32));
+  let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, base_block as i64);
+  return 0;
+}
+
+fn dharafs_append(path: Str, data: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  // Checked here too, not just inside dharafs_append_raw: these fixed-size
+  // temp buffers are sized exactly to the record format's own limits,
+  // and the copy loops below would overrun them before dharafs_append_raw
+  // ever got a chance to reject an oversized path/data itself.
+  if path_len <= 0 {
+    return 1;
+  }
+  if path_len > 32 {
+    return 1;
+  }
+  if data_len > dharafs_file_max_len() {
+    return 1;
+  }
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat(path, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { dharafs_user_get_uid() };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { dharafs_user_get_gid() };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < data_len {
+    let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+fn dharafs_read_raw_checked(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 1, 0, 0);
+  if allowed == 0 {
+    return 0 - 2;
+  }
+  return dharafs_read_raw(path_buf, path_len, out_buf);
+}
+
+fn dharafs_attr_immutable() -> u32 {
+  return 0x200 as u32;
+}
+
+fn dharafs_attr_append_only() -> u32 {
+  return 0x400 as u32;
+}
+
+fn dharafs_attr_system() -> u32 {
+  return 0x800 as u32;
+}
+
+fn dharafs_attr_mask() -> u32 {
+  return 0xE00 as u32;
+}
+
+fn dharafs_mode_is_immutable(mode: u32) -> i64 {
+  return if (mode & dharafs_attr_immutable()) != (0 as u32) { 1 } else { 0 };
+}
+
+fn dharafs_mode_is_append_only(mode: u32) -> i64 {
+  return if (mode & dharafs_attr_append_only()) != (0 as u32) { 1 } else { 0 };
+}
+
+fn dharafs_mode_blocks_delete(mode: u32) -> i64 {
+  return if (dharafs_mode_is_immutable(mode) == 1) || (dharafs_mode_is_append_only(mode) == 1) { 1 } else { 0 };
+}
+
+fn dharafs_mode_blocks_rename_source(mode: u32) -> i64 {
+  return dharafs_mode_is_immutable(mode);
+}
+
+fn dharafs_mode_blocks_overwrite(mode: u32) -> i64 {
+  return dharafs_mode_blocks_delete(mode);
+}
+
+fn dharafs_is_valid_append_only_write(old_buf: mut ref i64, old_len: i64, new_buf: mut ref i64, new_len: i64) -> i64 {
+  if new_len < old_len {
+    return 0;
+  }
+  let i: i64 = 0;
+  while i < old_len {
+    if buf_read_byte(old_buf, i as u32) != buf_read_byte(new_buf, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn dharafs_attr_check_write(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, mode: u32) -> i64 {
+  if dharafs_mode_is_immutable(mode) == 1 {
+    return 0 - 4;
+  }
+  if dharafs_mode_is_append_only(mode) == 1 {
+    let old_content: mut ref i64 = dharafs_appendonly_check_scratch_get();
+    let old_len: i64 = dharafs_read_raw(path_buf, path_len, old_content);
+    if old_len < 0 {
+      return 0 - 4;
+    }
+    if dharafs_is_valid_append_only_write(old_content, old_len, data_buf, data_len) == 0 {
+      return 0 - 4;
+    }
+  }
+  return 0;
+}
+
+fn dharafs_write_raw_checked(path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { req_uid };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { req_gid };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
+  if stat_status == 0 {
+    let attr_status: i64 = dharafs_attr_check_write(path_buf, path_len, data_buf, data_len, mode);
+    if attr_status != 0 {
+      return attr_status;
+    }
+    let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+    if allowed == 0 {
+      return 0 - 2;
+    }
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+fn dharafs_delete_raw_checked(path_buf: mut ref i64, path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  if dharafs_mode_blocks_delete(mode) == 1 {
+    return 0 - 4;
+  }
+  // Deletion needs write permission, same simplified-from-real-Unix
+  // rule dharafs_write_raw_checked's own comment already explains (a real
+  // system checks the containing DIRECTORY's write bit, not the
+  // file's own -- Dhruva has no directory objects to check instead).
+  let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+  if allowed == 0 {
+    return 0 - 2;
+  }
+  return dharafs_delete_raw(path_buf, path_len);
+}
+
+fn dharafs_rename_raw_checked(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64, req_uid: u32, req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(old_path_buf, old_path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  if dharafs_mode_blocks_rename_source(mode) == 1 {
+    return 0 - 4;
+  }
+  let allowed: i64 = dharafs_check_permission(owner_uid, owner_gid, mode, req_uid, req_gid, 0, 1, 0);
+  if allowed == 0 {
+    return 0 - 2;
+  }
+
+  // meta_buf is reused here -- old_path's owner/gid/mode were already
+  // captured into the locals above, so overwriting it with new_path's
+  // metadata (if any) is safe.
+  let new_stat_status: i64 = dharafs_stat_raw(new_path_buf, new_path_len, meta_buf);
+  if new_stat_status == 0 {
+    let new_owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+    let new_owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+    let new_mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+    if dharafs_mode_blocks_overwrite(new_mode) == 1 {
+      return 0 - 4;
+    }
+    let new_allowed: i64 = dharafs_check_permission(new_owner_uid, new_owner_gid, new_mode, req_uid, req_gid, 0, 1, 0);
+    if new_allowed == 0 {
+      return 0 - 2;
+    }
+  }
+
+  return dharafs_rename_raw(old_path_buf, old_path_len, new_path_buf, new_path_len);
+}
+
+fn dharafs_chmod(path: Str, mode: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat(path, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read(path, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  let path_len: i64 = str_len_bytes(path);
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+fn dharafs_chown(path: Str, uid: u32, gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat(path, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read(path, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  let path_len: i64 = str_len_bytes(path);
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, uid, gid, mode);
+}
+
+fn dharafs_chmod_checked(path_buf: mut ref i64, path_len: i64, new_mode: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  if (req_uid != owner_uid) && (req_uid != (0 as u32)) {
+    return 0 - 2;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, new_mode);
+}
+
+fn dharafs_chown_checked(path_buf: mut ref i64, path_len: i64, new_uid: u32, new_gid: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  if req_uid != (0 as u32) {
+    return 0 - 2;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, new_uid, new_gid, mode);
+}
+
+fn dharafs_set_attr_raw(path_buf: mut ref i64, path_len: i64, new_attr_bits: u32, req_uid: u32, _req_gid: u32) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  let is_owner: i64 = if req_uid == owner_uid { 1 } else { 0 };
+  let is_root: i64 = if req_uid == (0 as u32) { 1 } else { 0 };
+  if (is_owner == 0) && (is_root == 0) {
+    return 0 - 2;
+  }
+  let current_attr: u32 = mode & dharafs_attr_mask();
+  let requested_attr: u32 = new_attr_bits & dharafs_attr_mask();
+  if is_root == 0 {
+    let clearing_immutable: i64 = if ((current_attr & dharafs_attr_immutable()) != (0 as u32)) && ((requested_attr & dharafs_attr_immutable()) == (0 as u32)) { 1 } else { 0 };
+    let clearing_append: i64 = if ((current_attr & dharafs_attr_append_only()) != (0 as u32)) && ((requested_attr & dharafs_attr_append_only()) == (0 as u32)) { 1 } else { 0 };
+    if (clearing_immutable == 1) || (clearing_append == 1) {
+      return 0 - 2;
+    }
+  }
+  let not_attr_mask: u32 = dharafs_attr_mask() ^ (0xFFFFFFFF as u32);
+  let new_mode: u32 = (mode & not_attr_mask) | requested_attr;
+
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(path_buf, path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1;
+  }
+  return dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, new_mode);
+}
+
+fn dharafs_get_attr_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(path_buf, path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1;
+  }
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+  return (mode & dharafs_attr_mask()) as i64;
+}
+
+fn dharafs_find_latest_block_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  // Fast path: the hashed directory index (boot/dirindex_state.S) is
+  // kept exactly in sync with every write that reaches this path
+  // (dharafs_append_raw/dharafs_delete_raw upsert on success,
+  // dharafs_init rebuilds it at boot) -- a HIT is always correct and
+  // returned directly, no scan needed. A MISS falls through to the
+  // exact same linear scan this function has always done (never a
+  // regression), which then self-heals the index below so the same
+  // path is fast on every subsequent lookup.
+  let cached_block: i64 = dharafs_dirindex_lookup_raw(path_buf, path_len);
+  if cached_block >= 0 {
+    return cached_block;
+  }
+
+  let next_block: u32 = dharafs_state_get_next_block();
+  let log_start: u32 = dharafs_state_get_log_start();
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let best_block: i64 = 0 - 1;
+  let best_seq: u32 = 0 as u32;
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      // Same "checksum match alone isn't enough" reasoning as
+      // dharafs_init's recovery scan -- see that comment for why seq_num
+      // != 0 is required too.
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        if (rec_path_len as i64) == path_len {
+          let matches: i64 = 1;
+          let k: i64 = 0;
+          while k < path_len {
+            let want: u32 = buf_read_byte(path_buf, k as u32);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if got != want {
+              matches = 0;
+            }
+            k = k + 1;
+          }
+          if matches == 1 {
+            if rec_seq >= best_seq {
+              best_seq = rec_seq;
+              best_block = blk;
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  if best_block >= 0 {
+    // Self-heal: this path wasn't indexed yet (a table-full skip, or
+    // simply never written through a hook that upserts) -- now that
+    // the scan found it the honest way, index it so next time is fast.
+    let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, best_block);
+  }
+  return best_block;
+}
+
+fn dharafs_find_latest_block(path: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  // No record could ever have a path this long (dharafs_append rejects it
+  // at write time) -- reject here too, before the copy below would
+  // overrun the fixed 32-byte temp buffer.
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_find_latest_block_raw(path_buf, path_len);
+}
+
+fn dharafs_find_block_as_of_raw(path_buf: mut ref i64, path_len: i64, max_seq: u32) -> i64 {
+  let next_block: u32 = dharafs_state_get_next_block();
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let best_block: i64 = 0 - 1;
+  let best_seq: u32 = 0 as u32;
+  let blk: i64 = 1;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) && (rec_seq <= max_seq) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        if (rec_path_len as i64) == path_len {
+          let matches: i64 = 1;
+          let k: i64 = 0;
+          while k < path_len {
+            let want: u32 = buf_read_byte(path_buf, k as u32);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if got != want {
+              matches = 0;
+            }
+            k = k + 1;
+          }
+          if matches == 1 {
+            if rec_seq >= best_seq {
+              best_seq = rec_seq;
+              best_block = blk;
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return best_block;
+}
+
+fn dharafs_snapshot_reset() -> i64 {
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    let _ = snapshot_valid_set_at(i as u32, 0 as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn dharafs_snapshot_find_by_name_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    if snapshot_valid_get_at(i as u32) == 1 {
+      if snapshot_name_len_get_at(i as u32) == name_len {
+        let matches: i64 = 1;
+        let k: i64 = 0;
+        while k < name_len {
+          let want: u32 = buf_read_byte(name_buf, k as u32);
+          let got: u32 = snapshot_get_name_byte((i * snapshot_max_name_bytes() + k) as u32) as u32;
+          if got != want {
+            matches = 0;
+          }
+          k = k + 1;
+        }
+        if matches == 1 {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn dharafs_snapshot_create_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  if (name_len <= 0) || (name_len > snapshot_max_name_bytes()) {
+    return 0 - 1;
+  }
+  if dharafs_snapshot_find_by_name_raw(name_buf, name_len) >= 0 {
+    return 0 - 1;
+  }
+  let slot: i64 = 0 - 1;
+  let i: i64 = 0;
+  while i < snapshot_max_slots() {
+    if (slot < 0) && (snapshot_valid_get_at(i as u32) == 0) {
+      slot = i;
+    }
+    i = i + 1;
+  }
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let next_seq: u32 = dharafs_state_get_next_seq();
+  let pinned_seq: u32 = if next_seq > (0 as u32) { next_seq - (1 as u32) } else { 0 as u32 };
+  let _ = snapshot_pinned_seq_set_at(slot as u32, pinned_seq);
+  let _ = snapshot_name_len_set_at(slot as u32, name_len as u32);
+  let k: i64 = 0;
+  while k < name_len {
+    let b: u32 = buf_read_byte(name_buf, k as u32);
+    let _ = snapshot_set_name_byte((slot * snapshot_max_name_bytes() + k) as u32, b);
+    k = k + 1;
+  }
+  let _ = snapshot_valid_set_at(slot as u32, 1 as u32);
+  return slot;
+}
+
+fn dharafs_snapshot_delete_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  let slot: i64 = dharafs_snapshot_find_by_name_raw(name_buf, name_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let _ = snapshot_valid_set_at(slot as u32, 0 as u32);
+  return 0;
+}
+
+fn dharafs_snapshot_pinned_seq_raw(name_buf: mut ref i64, name_len: i64) -> i64 {
+  let slot: i64 = dharafs_snapshot_find_by_name_raw(name_buf, name_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  return snapshot_pinned_seq_get_at(slot as u32);
+}
+
+fn dharafs_snapshot_read_raw(path_buf: mut ref i64, path_len: i64, name_buf: mut ref i64, name_len: i64, out_buf: mut ref i64) -> i64 {
+  let slot: i64 = dharafs_snapshot_find_by_name_raw(name_buf, name_len);
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let pinned_seq: u32 = snapshot_pinned_seq_get_at(slot as u32) as u32;
+  let blk: i64 = dharafs_find_block_as_of_raw(path_buf, path_len, pinned_seq);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  return dharafs_read_from_block_raw(blk, out_buf);
+}
+
+fn dharafs_snapshot_create(name: Str) -> i64 {
+  let name_len: i64 = str_len_bytes(name);
+  if (name_len <= 0) || (name_len > 32) {
+    return 0 - 1;
+  }
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_snapshot_create_raw(name_buf, name_len);
+}
+
+fn dharafs_snapshot_delete(name: Str) -> i64 {
+  let name_len: i64 = str_len_bytes(name);
+  if (name_len <= 0) || (name_len > 32) {
+    return 0 - 1;
+  }
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_snapshot_delete_raw(name_buf, name_len);
+}
+
+fn dharafs_snapshot_read(path: Str, name: Str, out_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let name_len: i64 = str_len_bytes(name);
+  if (path_len <= 0) || (path_len > 32) {
+    return 0 - 1;
+  }
+  if (name_len <= 0) || (name_len > 32) {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let name_buf: mut ref i64 = dharafs_dir_scratch_get();
+  let j: i64 = 0;
+  while j < name_len {
+    let _ = buf_write_byte(name_buf, j as u32, str_byte_at(name, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_snapshot_read_raw(path_buf, path_len, name_buf, name_len, out_buf);
+}
+
+fn dharafs_compact(buf: mut ref i64, path_buf: mut ref i64, data_buf: mut ref i64) -> i64 {
+  let log_start: u32 = dharafs_state_get_log_start();
+  let old_next_block: u32 = dharafs_state_get_next_block();
+
+  // Not worth the SD traffic on a short log -- stay genuinely
+  // low-cost when there's nothing meaningful to reclaim yet.
+  if (old_next_block - log_start) < (4 as u32) {
+    return 0;
+  }
+
+  // BUG (round 7 audit, 2026-08-27): every carry-forward write below
+  // used to discard its own return status (`let _ = dharafs_append_raw(...)`
+  // / `let _ = dharafs_delete_raw(...)`), and log_start advanced past
+  // old_next_block unconditionally once the scan finished -- regardless
+  // of whether any of those re-appends actually succeeded. Once
+  // log_start moves forward, the old copy of a record stops being
+  // scanned by dharafs_read/dharafs_find_latest_block_raw/dharafs_list for the rest
+  // of this boot (see this function's own header comment on why that's
+  // normally safe: an equivalent live copy exists beyond it). If a
+  // single SD write genuinely failed mid-pass -- round 5's audit fixed
+  // sdhost_write_block to actually detect that instead of silently
+  // reporting success, so this is now a real, live-detectable failure
+  // mode, not a hypothetical one -- the "equivalent live copy" premise
+  // is false: the new copy was never written, the old copy is about to
+  // become unreachable anyway, and that record's data is gone for good.
+  // Fixed by tracking every carry-forward's actual result and only
+  // advancing log_start if the whole pass was clean; a single failure
+  // leaves log_start where it was, so the old (still valid) copies stay
+  // reachable and the next compaction pass gets another chance.
+  let all_ok: i64 = 1;
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < old_next_block {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        // BUG (found via audit, 2026-08-27): rec_path_len/rec_data_len
+        // are on-disk fields covered by the checksum just verified
+        // above, so a random bit-flip or torn write is already very
+        // likely to be caught there -- but buf_checksum is a simple
+        // rotate-mix, not a cryptographic/collision-resistant hash,
+        // so a checksum match is strong evidence, not a proof, that
+        // these fields weren't corrupted into something out of range.
+        // Both used to feed straight into a copy-loop bound with only
+        // the tombstone-sentinel check below, no explicit range check
+        // against path_buf/data_buf's own real capacity -- the exact
+        // same "trust a length field, no bound" shape as the
+        // networking-layer bugs found earlier the same day, just with
+        // corrupted disk data playing the untrusted-input role instead
+        // of a hostile network segment. Skip the record entirely (same
+        // as failing the checksum check) rather than guess at
+        // truncating it.
+        //
+        // Round 39: rec_path_len == 0 marks a CONTINUATION block (see
+        // dharafs_init's own header comment) -- skip it here unconditionally.
+        // It's never independently live/dead; it gets carried forward
+        // correctly as part of its own HEAD block's dharafs_read_raw/
+        // dharafs_append_raw round trip below, not by being re-appended on
+        // its own (which would be meaningless -- a continuation has no
+        // path to look up or preserve identity for).
+        if (rec_path_len > (0 as u32)) && (rec_path_len <= (32 as u32)) {
+        let k: i64 = 0;
+        while (k as u32) < rec_path_len {
+          let pb: u32 = buf_read_byte(buf, (12 + k) as u32);
+          let _ = buf_write_byte(path_buf, k as u32, pb);
+          k = k + 1;
+        }
+        let latest_blk: i64 = dharafs_find_latest_block_raw(path_buf, rec_path_len as i64);
+        if latest_blk == blk {
+          // This IS the live copy for its path -- carry it forward.
+          // dharafs_append_raw always targets dharafs_state_get_next_block(),
+          // which by now is already past old_next_block (every
+          // earlier iteration's re-append only ever grows it), so
+          // this can never write back into the region still being
+          // scanned.
+          let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
+          if rec_data_len == (0xFFFFFFFF as u32) {
+            // A live tombstone (dharafs_delete's newest record for this
+            // path) -- carry it forward AS a tombstone, not as a
+            // 4-billion-byte "data" copy. Missing this case doesn't
+            // just mis-handle a delete: rec_data_len is read directly
+            // into the loop bound below when it's a real record, so
+            // treating the sentinel as a genuine length turns this
+            // into an unbounded copy loop that reads/writes far past
+            // data_buf's real allocation -- a real hang (found by GC
+            // silently never completing a pass again once this path
+            // was ever exercised), not merely a logic error that
+            // happens to still terminate wrong.
+            let del_status: i64 = dharafs_delete_raw(path_buf, rec_path_len as i64);
+            if del_status != 0 {
+              all_ok = 0;
+            }
+          } else {
+            // Round 39: this HEAD block may chain across several
+            // blocks now -- reconstruct the FULL logical content via
+            // dharafs_read_raw (the same chain-following, checksum-
+            // verifying logic every other caller uses) rather than
+            // copying just this one block's own up-to-448-byte chunk,
+            // which would silently truncate any multi-block record.
+            // dharafs_read_raw's own internal dharafs_sd_scratch use doesn't
+            // conflict with `buf` here -- separate, caller-owned
+            // buffers, and this block's own fields have already been
+            // read out above before this call.
+            let full_len: i64 = dharafs_read_raw(path_buf, rec_path_len as i64, data_buf);
+            if full_len < 0 {
+              all_ok = 0;
+            } else {
+              // Round 42: preserve the existing owner/group/mode --
+              // compaction relocates a record's storage, it must never
+              // change who owns it or what it's permitted for. `buf`
+              // here is still this HEAD block as read off the card
+              // (rec_path_len/etc. above were read from it directly),
+              // so its owner_uid/owner_gid/mode fields are still the
+              // real, current ones.
+              let rec_uid: u32 = buf_read_u32(buf, 52 as u32);
+              let rec_gid: u32 = buf_read_u32(buf, 56 as u32);
+              let rec_mode: u32 = buf_read_u32(buf, 60 as u32);
+              let append_status: i64 = dharafs_append_raw(path_buf, rec_path_len as i64, data_buf, full_len, rec_uid, rec_gid, rec_mode);
+              if append_status != 0 {
+                all_ok = 0;
+              }
+            }
+          }
+        }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+
+  // Everything before old_next_block now has an equivalent live copy
+  // at or beyond it (or was already dead) -- safe to stop scanning.
+  // Only true if every carry-forward above actually succeeded (see
+  // this function's own header comment) -- a failed one leaves its
+  // only copy in the region about to be abandoned, so log_start must
+  // stay put in that case rather than orphan it.
+  if all_ok == 1 {
+    let _ = dharafs_state_set_log_start(old_next_block);
+  }
+  return 0;
+}
+
+fn dharafs_stat_raw(path_buf: mut ref i64, path_len: i64, meta_buf: mut ref i64) -> i64 {
+  let blk: i64 = dharafs_find_latest_block_raw(path_buf, path_len);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  let tmp: mut ref i64 = dharafs_sd_scratch_get();
+  let rd_status: i64 = dharafs_block_read(blk, tmp);
+  if rd_status != 0 {
+    return 0 - 1;
+  }
+  let data_len: u32 = buf_read_u32(tmp, 44 as u32);
+  if data_len == (0xFFFFFFFF as u32) {
+    return 0 - 1; // tombstone -- deleted, same as dharafs_read_raw's own check
+  }
+  let _ = buf_write_u32(meta_buf, 0 as u32, buf_read_u32(tmp, 52 as u32));
+  let _ = buf_write_u32(meta_buf, 4 as u32, buf_read_u32(tmp, 56 as u32));
+  let _ = buf_write_u32(meta_buf, 8 as u32, buf_read_u32(tmp, 60 as u32));
+  return 0;
+}
+
+fn dharafs_stat(path: Str, meta_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len <= 0 {
+    return 0 - 1;
+  }
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_stat_raw(path_buf, path_len, meta_buf);
+}
+
+fn dharafs_read_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
+  let blk: i64 = dharafs_find_latest_block_raw(path_buf, path_len);
+  if blk < 0 {
+    return 0 - 1;
+  }
+  return dharafs_read_from_block_raw(blk, out_buf);
+}
+
+fn dharafs_read_from_block_raw(blk: i64, out_buf: mut ref i64) -> i64 {
+  let tmp: mut ref i64 = dharafs_sd_scratch_get();
+  let rd_status: i64 = dharafs_block_read(blk, tmp);
+  if rd_status != 0 {
+    return 0 - 1;
+  }
+  let total_len: u32 = buf_read_u32(tmp, 44 as u32);
+  if total_len == (0xFFFFFFFF as u32) {
+    return 0 - 1;
+  }
+  // BUG (found via audit, 2026-08-27): data_len is an on-disk field
+  // covered by dharafs_find_latest_block_raw's own checksum validation,
+  // but a checksum match is strong evidence, not proof, against
+  // corruption (buf_checksum is a simple rotate-mix, not collision-
+  // resistant) -- and out_buf's own real capacity is entirely up to
+  // the caller regardless. Reject rather than trust an out-of-range
+  // length as a copy-loop bound.
+  if (total_len as i64) > dharafs_file_max_len() {
+    return 0 - 1;
+  }
+  let cap: i64 = dharafs_block_payload_cap();
+  let total_len_i: i64 = total_len as i64;
+  let head_chunk: i64 = if total_len_i < cap { total_len_i } else { cap };
+  let i: i64 = 0;
+  while i < head_chunk {
+    let b: u32 = buf_read_byte(tmp, (64 + i) as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let copied: i64 = head_chunk;
+  let remaining: i64 = total_len_i - head_chunk;
+  let next_blk: i64 = buf_read_u32(tmp, 48 as u32) as i64;
+
+  // Round 39: follow the chain for anything past the head's own
+  // 448-byte chunk (Round 42 shrank the per-block payload cap from
+  // 460 to make room for owner_uid/owner_gid/mode). Every continuation
+  // block gets the SAME "reject,
+  // don't guess" checksum/sentinel validation as any other record --
+  // a broken or corrupted chain fails the whole read rather than
+  // silently handing back a truncated prefix.
+  while remaining > 0 {
+    if next_blk == 0 {
+      return 0 - 1; // chain ended early -- corrupt/broken, reject
+    }
+    let cont: mut ref i64 = dharafs_sd_scratch_get();
+    if dharafs_block_read(next_blk, cont) != 0 {
+      return 0 - 1;
+    }
+    let stored_checksum: u32 = buf_read_u32(cont, 0 as u32);
+    let computed_checksum: u32 = buf_checksum(cont, 4 as u32, 508 as u32);
+    let cont_seq: u32 = buf_read_u32(cont, 4 as u32);
+    if (stored_checksum != computed_checksum) || (cont_seq == (0 as u32)) {
+      return 0 - 1;
+    }
+    let cont_path_len: u32 = buf_read_u32(cont, 8 as u32);
+    if cont_path_len != (0 as u32) {
+      return 0 - 1; // not a continuation marker -- chain is wrong
+    }
+    let cont_len: i64 = buf_read_u32(cont, 44 as u32) as i64;
+    // BUG (found via host-side ASAN/UBSAN harness, 2026-08-29): this used
+    // to accept cont_len == 0 (the `< 0` half of this check is dead code
+    // in the first place -- a u32-read-then-cast-to-i64 can never be
+    // negative). No REAL append path ever writes a zero-length
+    // continuation chunk (every genuine chunk's own length is > 0 by
+    // construction in dharafs_append_raw's multi-block split), but a
+    // corrupted or deliberately adversarial disk image can contain one
+    // -- and `this_chunk` below would then be 0, `remaining` would never
+    // decrease, and a `next_block` field pointing back into the chain
+    // (even at just this same block) turns this loop into a genuine
+    // infinite loop / hang, not merely a logic error that still
+    // terminates wrong. Rejecting cont_len <= 0 closes it: every real
+    // chain still reads correctly (see this comment's own reasoning for
+    // why a real chunk is always > 0), and a malformed one now fails
+    // the read instead of hanging the caller forever.
+    if (cont_len <= 0) || (cont_len > cap) {
+      return 0 - 1;
+    }
+    let this_chunk: i64 = if cont_len < remaining { cont_len } else { remaining };
+    let k: i64 = 0;
+    while k < this_chunk {
+      let b2: u32 = buf_read_byte(cont, (64 + k) as u32);
+      let _ = buf_write_byte(out_buf, (copied + k) as u32, b2);
+      k = k + 1;
+    }
+    copied = copied + this_chunk;
+    remaining = remaining - this_chunk;
+    next_blk = buf_read_u32(cont, 48 as u32) as i64;
+  }
+  return total_len_i;
+}
+
+fn dharafs_read(path: Str, out_buf: mut ref i64) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len <= 0 {
+    return 0 - 1;
+  }
+  if path_len > 32 {
+    return 0 - 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_read_raw(path_buf, path_len, out_buf);
+}
+
+fn dharafs_delete_raw(path_buf: mut ref i64, path_len: i64) -> i64 {
+  if path_len <= 0 {
+    return 1; // same reserved-sentinel reasoning as dharafs_append_raw
+  }
+  if path_len > 32 {
+    return 1;
+  }
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let next_block: u32 = dharafs_state_get_next_block();
+  let next_seq: u32 = dharafs_state_get_next_seq();
+
+  let _ = buf_write_u32(buf, 4 as u32, next_seq);
+  let _ = buf_write_u32(buf, 8 as u32, path_len as u32);
+  let i: i64 = 0;
+  while i < path_len {
+    let b: u32 = buf_read_byte(path_buf, i as u32);
+    let _ = buf_write_byte(buf, (12 + i) as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_u32(buf, 44 as u32, 0xFFFFFFFF as u32);
+  // Round 39: a tombstone never chains -- but buf is dharafs_sd_scratch, a
+  // PERSISTENT reused buffer, so this field must be written explicitly
+  // rather than assumed zero; a stale next_block from whatever this
+  // buffer last held would otherwise leak into a brand-new record.
+  let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
+  // Round 42: same stale-scratch-buffer reasoning as next_block above
+  // -- a tombstone has no meaningful owner/mode, but dharafs_sd_scratch is
+  // reused, so these must be zeroed explicitly rather than assumed.
+  let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
+
+  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, checksum);
+
+  let wr_status: i64 = dharafs_block_write(next_block as i64, buf);
+  if wr_status != 0 {
+    return 1;
+  }
+  let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  let _ = dharafs_dirindex_upsert_raw(path_buf, path_len, next_block as i64);
+  return 0;
+}
+
+fn dharafs_delete(path: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  if path_len > 32 {
+    return 1;
+  }
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  return dharafs_delete_raw(path_buf, path_len);
+}
+
+fn dharafs_tx_begin_sentinel() -> u32 {
+  return 0xFFFFFFF0 as u32; // distinct from the continuation marker
+                            // (0) and every real path_len (1-32)
+}
+
+fn dharafs_tx_begin_raw(block_count: i64) -> i64 {
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let next_block: u32 = dharafs_state_get_next_block();
+  let next_seq: u32 = dharafs_state_get_next_seq();
+  let _ = buf_write_u32(buf, 4 as u32, next_seq);
+  let _ = buf_write_u32(buf, 8 as u32, dharafs_tx_begin_sentinel());
+  let z: i64 = 0;
+  while z < 32 {
+    let _ = buf_write_byte(buf, (12 + z) as u32, 0 as u32);
+    z = z + 1;
+  }
+  let _ = buf_write_u32(buf, 44 as u32, block_count as u32); // repurposed as block_count
+  let _ = buf_write_u32(buf, 48 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 52 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 56 as u32, 0 as u32);
+  let _ = buf_write_u32(buf, 60 as u32, 0 as u32);
+  let checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(buf, 0 as u32, checksum);
+  let wr_status: i64 = dharafs_block_write(next_block as i64, buf);
+  if wr_status != 0 {
+    return 1;
+  }
+  let _ = dharafs_state_set(next_block + (1 as u32), next_seq + (1 as u32));
+  return 0;
+}
+
+fn dharafs_rename_raw(old_path_buf: mut ref i64, old_path_len: i64, new_path_buf: mut ref i64, new_path_len: i64) -> i64 {
+  if (old_path_len <= 0) || (old_path_len > 32) || (new_path_len <= 0) || (new_path_len > 32) {
+    return 1;
+  }
+
+  // Renaming a path to itself must be a no-op success, checked BEFORE
+  // anything else below: without this, appending under new_path
+  // (identical to old_path) would immediately be tombstoned by the
+  // delete-old step that follows it.
+  if old_path_len == new_path_len {
+    let same: i64 = 1;
+    let si: i64 = 0;
+    while si < old_path_len {
+      if buf_read_byte(old_path_buf, si as u32) != buf_read_byte(new_path_buf, si as u32) {
+        same = 0;
+      }
+      si = si + 1;
+    }
+    if same == 1 {
+      return 0;
+    }
+  }
+
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat_raw(old_path_buf, old_path_len, meta_buf);
+  if stat_status != 0 {
+    return 0 - 1; // old path not found
+  }
+  let owner_uid: u32 = buf_read_u32(meta_buf, 0 as u32);
+  let owner_gid: u32 = buf_read_u32(meta_buf, 4 as u32);
+  let mode: u32 = buf_read_u32(meta_buf, 8 as u32);
+
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let data_len: i64 = dharafs_read_raw(old_path_buf, old_path_len, data_buf);
+  if data_len < 0 {
+    return 0 - 1; // tombstone or corrupt -- nothing real to rename
+  }
+
+  // The append below may itself span multiple blocks for a large
+  // file (dharafs_append_raw's own multi-block path) -- the tx_begin
+  // marker's block_count only needs to cover the delete's own single
+  // tombstone block PLUS however many blocks the append consumes.
+  // dharafs_block_payload_cap() is the per-block data capacity; ceil-
+  // divide data_len by it the same way dharafs_append_raw's own
+  // multi-block path already computes num_chunks.
+  let cap: i64 = dharafs_block_payload_cap();
+  let append_block_count: i64 = if data_len <= cap { 1 } else { (data_len + cap - 1) / cap };
+  let tx_status: i64 = dharafs_tx_begin_raw(append_block_count + 1);
+  if tx_status != 0 {
+    return 1;
+  }
+
+  let append_status: i64 = dharafs_append_raw(new_path_buf, new_path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+  if append_status != 0 {
+    return 1; // new path write failed -- old path is untouched
+  }
+
+  let del_status: i64 = dharafs_delete_raw(old_path_buf, old_path_len);
+  if del_status != 0 {
+    return 1;
+  }
+  return 0;
+}
+
+fn dharafs_rename(old_path: Str, new_path: Str) -> i64 {
+  let old_len: i64 = str_len_bytes(old_path);
+  let new_len: i64 = str_len_bytes(new_path);
+  if (old_len <= 0) || (old_len > 32) || (new_len <= 0) || (new_len > 32) {
+    return 1;
+  }
+  let old_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < old_len {
+    let _ = buf_write_byte(old_buf, i as u32, str_byte_at(old_path, i) as u32);
+    i = i + 1;
+  }
+  // dharafs_path_scratch is the one shared path buffer every other
+  // Str-based DharaFS entry point above already uses -- a rename needs
+  // a SECOND path live at once, so new_path gets its own dedicated
+  // PERSISTENT scratch buffer (dharafs_rename_new_path_scratch) rather
+  // than contending for the same slot old_path just filled. BUG FIX:
+  // this used to be a fresh dharafs_alloc_bytes(32) here, leaking 32
+  // bytes on every single call -- the exact bug class round 49's own
+  // audit already found once in round 48's code, found again here via
+  // a follow-up sweep.
+  let new_buf: mut ref i64 = dharafs_rename_new_path_scratch_get();
+  let j: i64 = 0;
+  while j < new_len {
+    let _ = buf_write_byte(new_buf, j as u32, str_byte_at(new_path, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_rename_raw(old_buf, old_len, new_buf, new_len);
+}
+
+fn dharafs_verified_companion_path_raw(path_buf: mut ref i64, path_len: i64, out_buf: mut ref i64) -> i64 {
+  if (path_len + 7) > 32 {
+    return 0 - 1;
+  }
+  let i: i64 = 0;
+  while i < path_len {
+    let b: u32 = buf_read_byte(path_buf, i as u32);
+    let _ = buf_write_byte(out_buf, i as u32, b);
+    i = i + 1;
+  }
+  let _ = buf_write_byte(out_buf, (path_len + 0) as u32, 46 as u32);  // '.'
+  let _ = buf_write_byte(out_buf, (path_len + 1) as u32, 115 as u32); // 's'
+  let _ = buf_write_byte(out_buf, (path_len + 2) as u32, 104 as u32); // 'h'
+  let _ = buf_write_byte(out_buf, (path_len + 3) as u32, 97 as u32);  // 'a'
+  let _ = buf_write_byte(out_buf, (path_len + 4) as u32, 50 as u32);  // '2'
+  let _ = buf_write_byte(out_buf, (path_len + 5) as u32, 53 as u32);  // '5'
+  let _ = buf_write_byte(out_buf, (path_len + 6) as u32, 54 as u32);  // '6'
+  return path_len + 7;
+}
+
+// dharafs_write_verified_checked (and its sibling dharafs_read_verified)
+// are deliberately NOT part of this package: both are thin wrappers around
+// dharafs_write_verified_raw / dharafs_read_verified_checked, which belong
+// to the SHA-256-hash-verified companion-file feature -- a crypto-tier
+// feature this core-FS package excludes on purpose (see header.vani).
+
+fn dharafs_log_rollover_threshold() -> i64 {
+  return 3584; // headroom under dharafs_file_max_len() (4096) --
+               // combined with the 512-byte per-record cap below,
+               // dharafs_log_combined_scratch (sized exactly 4096)
+               // can never overflow: 3584 + 512 = 4096 exactly.
+}
+
+fn dharafs_log_record_max_len() -> i64 {
+  return 512; // one "reasonable log line" -- generous for a sensor
+              // reading or short structured record, small enough that
+              // the rollover-threshold math above stays exact.
+}
+
+fn dharafs_log_retention_count() -> i64 {
+  return 5;
+}
+
+fn dharafs_log_write_index_digits(out_buf: mut ref i64, offset: i64, index: u32) -> i64 {
+  let d0: u32 = (index / (1000 as u32)) % (10 as u32);
+  let d1: u32 = (index / (100 as u32)) % (10 as u32);
+  let d2: u32 = (index / (10 as u32)) % (10 as u32);
+  let d3: u32 = index % (10 as u32);
+  let _ = buf_write_byte(out_buf, offset as u32, (48 as u32) + d0);
+  let _ = buf_write_byte(out_buf, (offset + 1) as u32, (48 as u32) + d1);
+  let _ = buf_write_byte(out_buf, (offset + 2) as u32, (48 as u32) + d2);
+  let _ = buf_write_byte(out_buf, (offset + 3) as u32, (48 as u32) + d3);
+  return 0;
+}
+
+fn dharafs_log_path_raw(name_buf: mut ref i64, name_len: i64, index: u32, out_buf: mut ref i64) -> i64 {
+  let total_len: i64 = 15 + name_len;
+  if total_len > 32 {
+    return 0 - 1;
+  }
+  let _ = buf_write_byte(out_buf, 0 as u32, 47 as u32);  // '/'
+  let _ = buf_write_byte(out_buf, 1 as u32, 108 as u32); // 'l'
+  let _ = buf_write_byte(out_buf, 2 as u32, 111 as u32); // 'o'
+  let _ = buf_write_byte(out_buf, 3 as u32, 103 as u32); // 'g'
+  let _ = buf_write_byte(out_buf, 4 as u32, 115 as u32); // 's'
+  let _ = buf_write_byte(out_buf, 5 as u32, 47 as u32);  // '/'
+  let i: i64 = 0;
+  while i < name_len {
+    let b: u32 = buf_read_byte(name_buf, i as u32);
+    let _ = buf_write_byte(out_buf, (6 + i) as u32, b);
+    i = i + 1;
+  }
+  let dash_off: i64 = 6 + name_len;
+  let _ = buf_write_byte(out_buf, dash_off as u32, 45 as u32); // '-'
+  let _ = dharafs_log_write_index_digits(out_buf, dash_off + 1, index);
+  let ext_off: i64 = dash_off + 5;
+  let _ = buf_write_byte(out_buf, ext_off as u32, 46 as u32);      // '.'
+  let _ = buf_write_byte(out_buf, (ext_off + 1) as u32, 108 as u32); // 'l'
+  let _ = buf_write_byte(out_buf, (ext_off + 2) as u32, 111 as u32); // 'o'
+  let _ = buf_write_byte(out_buf, (ext_off + 3) as u32, 103 as u32); // 'g'
+  return total_len;
+}
+
+fn dharafs_log_header_path_raw(name_buf: mut ref i64, name_len: i64, out_buf: mut ref i64) -> i64 {
+  let total_len: i64 = 10 + name_len;
+  if total_len > 32 {
+    return 0 - 1;
+  }
+  let _ = buf_write_byte(out_buf, 0 as u32, 47 as u32);
+  let _ = buf_write_byte(out_buf, 1 as u32, 108 as u32);
+  let _ = buf_write_byte(out_buf, 2 as u32, 111 as u32);
+  let _ = buf_write_byte(out_buf, 3 as u32, 103 as u32);
+  let _ = buf_write_byte(out_buf, 4 as u32, 115 as u32);
+  let _ = buf_write_byte(out_buf, 5 as u32, 47 as u32);
+  let i: i64 = 0;
+  while i < name_len {
+    let b: u32 = buf_read_byte(name_buf, i as u32);
+    let _ = buf_write_byte(out_buf, (6 + i) as u32, b);
+    i = i + 1;
+  }
+  let ext_off: i64 = 6 + name_len;
+  let _ = buf_write_byte(out_buf, ext_off as u32, 46 as u32);       // '.'
+  let _ = buf_write_byte(out_buf, (ext_off + 1) as u32, 104 as u32); // 'h'
+  let _ = buf_write_byte(out_buf, (ext_off + 2) as u32, 100 as u32); // 'd'
+  let _ = buf_write_byte(out_buf, (ext_off + 3) as u32, 114 as u32); // 'r'
+  return total_len;
+}
+
+fn dharafs_log_append_raw(name_buf: mut ref i64, name_len: i64, record_buf: mut ref i64, record_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  if (name_len <= 0) || (record_len <= 0) {
+    return 1;
+  }
+  if record_len > dharafs_log_record_max_len() {
+    return 1;
+  }
+  let header_buf: mut ref i64 = dharafs_log_header_path_scratch_get();
+  let header_len: i64 = dharafs_log_header_path_raw(name_buf, name_len, header_buf);
+  if header_len < 0 {
+    return 0 - 1; // log name too long
+  }
+  let header_data: mut ref i64 = dharafs_log_header_data_scratch_get();
+  let hdr_read_len: i64 = dharafs_read_raw(header_buf, header_len, header_data);
+  let current_index: u32 = if hdr_read_len == 8 { buf_read_u32(header_data, 0 as u32) } else { 0 as u32 };
+  let current_size: i64 = if hdr_read_len == 8 { buf_read_u32(header_data, 4 as u32) as i64 } else { 0 };
+
+  let log_path_buf: mut ref i64 = dharafs_log_path_scratch_get();
+  let needs_rollover: i64 = if current_index == (0 as u32) { 1 } else {
+    if (current_size + record_len) > dharafs_log_rollover_threshold() { 1 } else { 0 }
+  };
+
+  if needs_rollover == 1 {
+    let new_index: u32 = current_index + (1 as u32);
+    if new_index > (9999 as u32) {
+      return 1; // exhausted the 4-digit rollover space
+    }
+    let log_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, new_index, log_path_buf);
+    if log_path_len < 0 {
+      return 0 - 1; // log name too long once combined with the file suffix
+    }
+    let write_status: i64 = dharafs_append_raw(log_path_buf, log_path_len, record_buf, record_len, owner_uid, owner_gid, mode);
+    if write_status != 0 {
+      return write_status;
+    }
+    let _ = buf_write_u32(header_data, 0 as u32, new_index);
+    let _ = buf_write_u32(header_data, 4 as u32, record_len as u32);
+    let header_write_status: i64 = dharafs_append_raw(header_buf, header_len, header_data, 8, owner_uid, owner_gid, mode);
+
+    // Round 66: GC the oldest generation now that the new file AND its
+    // header are both safely durable -- reclaiming before the header
+    // commits would risk pointing at a deleted file if a crash landed
+    // between the two, the same "old OR new, never mixed" ordering
+    // discipline this project's own transaction primitive already
+    // established elsewhere. Best-effort: a delete failure here (e.g.
+    // the old generation was already gone) doesn't fail the append that
+    // already genuinely succeeded, so this function's own return value
+    // still reflects only the part the caller actually asked for.
+    if header_write_status == 0 {
+      let retention: i64 = dharafs_log_retention_count();
+      if (new_index as i64) > retention {
+        let old_index: u32 = new_index - (retention as u32);
+        let old_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, old_index, log_path_buf);
+        if old_path_len > 0 {
+          let _ = dharafs_delete_raw(log_path_buf, old_path_len);
+        }
+      }
+    }
+    return header_write_status;
+  }
+
+  let log_path_len: i64 = dharafs_log_path_raw(name_buf, name_len, current_index, log_path_buf);
+  if log_path_len < 0 {
+    return 0 - 1;
+  }
+  let existing_data: mut ref i64 = dharafs_log_existing_scratch_get();
+  let existing_len_raw: i64 = dharafs_read_raw(log_path_buf, log_path_len, existing_data);
+  // Self-heals from an inconsistent header (e.g. the file it points at
+  // is somehow missing/corrupt) by treating the existing content as
+  // empty rather than failing the whole append -- the new record still
+  // gets written, just as if it were the first in a fresh file.
+  let existing_len: i64 = if existing_len_raw < 0 { 0 } else { existing_len_raw };
+  let combined_buf: mut ref i64 = dharafs_log_combined_scratch_get();
+  let i: i64 = 0;
+  while i < existing_len {
+    let b: u32 = buf_read_byte(existing_data, i as u32);
+    let _ = buf_write_byte(combined_buf, i as u32, b);
+    i = i + 1;
+  }
+  let j: i64 = 0;
+  while j < record_len {
+    let b2: u32 = buf_read_byte(record_buf, j as u32);
+    let _ = buf_write_byte(combined_buf, (existing_len + j) as u32, b2);
+    j = j + 1;
+  }
+  let combined_len: i64 = existing_len + record_len;
+  let write_status2: i64 = dharafs_append_raw(log_path_buf, log_path_len, combined_buf, combined_len, owner_uid, owner_gid, mode);
+  if write_status2 != 0 {
+    return write_status2;
+  }
+  let _ = buf_write_u32(header_data, 0 as u32, current_index);
+  let _ = buf_write_u32(header_data, 4 as u32, combined_len as u32);
+  return dharafs_append_raw(header_buf, header_len, header_data, 8, owner_uid, owner_gid, mode);
+}
+
+fn dharafs_log_append(name: Str, line: Str) -> i64 {
+  let name_len: i64 = str_len_bytes(name);
+  let line_len_s: i64 = str_len_bytes(line);
+  if (name_len <= 0) || (line_len_s <= 0) {
+    return 1;
+  }
+  let name_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < name_len {
+    let _ = buf_write_byte(name_buf, i as u32, str_byte_at(name, i) as u32);
+    i = i + 1;
+  }
+  let record_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < line_len_s {
+    let _ = buf_write_byte(record_buf, j as u32, str_byte_at(line, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_log_append_raw(name_buf, name_len, record_buf, line_len_s, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+}
+
+fn dharafs_multiblock_self_test() -> i64 {
+  let ok: i64 = 1;
+  let file_len: i64 = 1000;
+  let write_buf: mut ref i64 = dharafs_alloc_bytes(1000);
+  let _ = test_fill_pattern(write_buf, 1000);
+
+  // Raw pattern bytes aren't valid Str/UTF-8 content, so this goes
+  // through dharafs_append_raw/dharafs_read_raw directly rather than dharafs_append's
+  // own Str-based wrapper, matching every other raw-content self-test
+  // in this project.
+  let path_buf: mut ref i64 = dharafs_alloc_bytes(16);
+  let path_bytes: Str = "/bigfile/data";
+  let path_len: i64 = str_len_bytes(path_bytes);
+  let pi: i64 = 0;
+  while pi < path_len {
+    let _ = buf_write_byte(path_buf, pi as u32, str_byte_at(path_bytes, pi) as u32);
+    pi = pi + 1;
+  }
+  let write_status: i64 = dharafs_append_raw(path_buf, path_len, write_buf, file_len, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+  if write_status != 0 {
+    ok = 0;
+  }
+
+  let read_buf: mut ref i64 = dharafs_alloc_bytes(1000);
+  let read_len: i64 = dharafs_read_raw(path_buf, path_len, read_buf);
+  if read_len != file_len {
+    ok = 0;
+  }
+  let mismatch: i64 = test_compare_buffers(write_buf, read_buf, file_len);
+  if mismatch != 0 {
+    ok = 0;
+  }
+
+  // Overwrite with a DIFFERENT multi-block payload, confirm the
+  // lookup correctly follows the NEW chain's head, not a leftover
+  // continuation block from the old one (every continuation block's
+  // path_len=0 sentinel makes this structurally impossible to get
+  // wrong, but proving it live is still the point, not just trusting
+  // the design on paper).
+  let write_buf2: mut ref i64 = dharafs_alloc_bytes(1000);
+  let qi: i64 = 0;
+  while qi < 1000 {
+    let _ = buf_write_byte(write_buf2, qi as u32, ((qi * 7) & 0xFF) as u32);
+    qi = qi + 1;
+  }
+  let write_status2: i64 = dharafs_append_raw(path_buf, path_len, write_buf2, file_len, dharafs_user_get_uid(), dharafs_user_get_gid(), dharafs_default_mode());
+  if write_status2 != 0 {
+    ok = 0;
+  }
+  let read_buf2: mut ref i64 = dharafs_alloc_bytes(1000);
+  let read_len2: i64 = dharafs_read_raw(path_buf, path_len, read_buf2);
+  if read_len2 != file_len {
+    ok = 0;
+  }
+  let mismatch2: i64 = test_compare_buffers(write_buf2, read_buf2, file_len);
+  if mismatch2 != 0 {
+    ok = 0;
+  }
+
+  let _ = dharafs_log_puts("DharaFS: multi-block file round trip (1000 bytes, 3 chunks) + overwrite");
+  if ok == 1 {
+    let _ = dharafs_log_puts(" (PASS)\n");
+  } else {
+    let _ = dharafs_log_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+fn dharafs_multiblock_crash_consistency_self_test() -> i64 {
+  let ok: i64 = 1;
+  let path: Str = "/crashtest/file";
+  let old_value: Str = "safe-old-value";
+  let _ = dharafs_append(path, old_value);
+
+  let phantom_block: i64 = dharafs_state_get_next_block() as i64;
+  let phantom_buf: mut ref i64 = dharafs_alloc_bytes(512);
+  let _ = buf_write_u32(phantom_buf, 4 as u32, 999999 as u32); // seq far
+                          // higher than any real record so far
+  let _ = buf_write_u32(phantom_buf, 8 as u32, 0 as u32); // continuation marker
+  let z: i64 = 0;
+  while z < 32 {
+    let _ = buf_write_byte(phantom_buf, (12 + z) as u32, 0 as u32);
+    z = z + 1;
+  }
+  let _ = buf_write_u32(phantom_buf, 44 as u32, 10 as u32);
+  let _ = buf_write_u32(phantom_buf, 48 as u32, 0 as u32); // next_block=0
+  let p: i64 = 0;
+  while p < 10 {
+    let _ = buf_write_byte(phantom_buf, (52 + p) as u32, 88 as u32); // 'X'
+    p = p + 1;
+  }
+  let checksum: u32 = buf_checksum(phantom_buf, 4 as u32, 508 as u32);
+  let _ = buf_write_u32(phantom_buf, 0 as u32, checksum);
+  let _ = dharafs_block_write(phantom_block, phantom_buf);
+  // Deliberately no dharafs_state_set call -- see this function's own
+  // header comment for why that omission IS the simulated crash.
+
+  let out_buf: mut ref i64 = dharafs_alloc_bytes(32);
+  let read_len: i64 = dharafs_read(path, out_buf);
+  let expected_len: i64 = str_len_bytes(old_value);
+  if read_len != expected_len {
+    ok = 0;
+  }
+  let ci: i64 = 0;
+  while ci < expected_len {
+    let want: i64 = str_byte_at(old_value, ci);
+    let got: u32 = buf_read_byte(out_buf, ci as u32);
+    if (got as i64) != want {
+      ok = 0;
+    }
+    ci = ci + 1;
+  }
+
+  let _ = dharafs_log_puts("DharaFS: simulated crash mid-multi-block-write leaves old version intact");
+  if ok == 1 {
+    let _ = dharafs_log_puts(" (PASS)\n");
+  } else {
+    let _ = dharafs_log_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+fn dharafs_dirlist_seen_contains(seen: mut ref i64, count: i64, path_buf: mut ref i64, seg_start: i64, seg_len: i64) -> i64 {
+  let idx: i64 = 0;
+  while idx < count {
+    let slot_off: i64 = idx * 32;
+    let slot_len: u32 = buf_read_byte(seen, slot_off as u32);
+    if (slot_len as i64) == seg_len {
+      let matches: i64 = 1;
+      let k: i64 = 0;
+      while k < seg_len {
+        let a: u32 = buf_read_byte(seen, (slot_off + 1 + k) as u32);
+        let b: u32 = buf_read_byte(path_buf, (seg_start + k) as u32);
+        if a != b {
+          matches = 0;
+        }
+        k = k + 1;
+      }
+      if matches == 1 {
+        return 1;
+      }
+    }
+    idx = idx + 1;
+  }
+  return 0;
+}
+
+fn dharafs_dirlist_segment_equals(query_buf: mut ref i64, query_len: i64, path_buf: mut ref i64, seg_start: i64, seg_len: i64) -> i64 {
+  if query_len != seg_len {
+    return 0;
+  }
+  let k: i64 = 0;
+  while k < seg_len {
+    let a: u32 = buf_read_byte(query_buf, k as u32);
+    let b: u32 = buf_read_byte(path_buf, (seg_start + k) as u32);
+    if a != b {
+      return 0;
+    }
+    k = k + 1;
+  }
+  return 1;
+}
+
+fn dharafs_list_dir_raw(dir_buf: mut ref i64, dir_len: i64, query_buf: mut ref i64, query_len: i64) -> i64 {
+  let skip_len: i64 = if dir_len == 0 { 1 } else { dir_len + 1 };
+  let next_block: u32 = dharafs_state_get_next_block();
+  let log_start: u32 = dharafs_state_get_log_start();
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let seen: mut ref i64 = dharafs_data_scratch_get();
+  let seen_count: i64 = 0;
+  let classify_result: i64 = 0;
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
+        let long_enough: i64 = 0;
+        if (rec_path_len > (0 as u32)) && ((rec_path_len as i64) > skip_len) {
+          long_enough = 1;
+        }
+        if (long_enough == 1) && (rec_data_len != (0xFFFFFFFF as u32)) {
+          let prefix_matches: i64 = 1;
+          if dir_len == 0 {
+            let first: u32 = buf_read_byte(buf, 12 as u32);
+            if first != (47 as u32) {
+              prefix_matches = 0;
+            }
+          } else {
+            let k: i64 = 0;
+            while k < dir_len {
+              let want: u32 = buf_read_byte(dir_buf, k as u32);
+              let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+              if got != want {
+                prefix_matches = 0;
+              }
+              k = k + 1;
+            }
+            let slash: u32 = buf_read_byte(buf, (12 + dir_len) as u32);
+            if slash != (47 as u32) {
+              prefix_matches = 0;
+            }
+          }
+          if (prefix_matches == 1) && (rec_path_len <= (32 as u32)) {
+            let path_buf: mut ref i64 = dharafs_path_scratch_get();
+            let m: i64 = 0;
+            while (m as u32) < rec_path_len {
+              let pb: u32 = buf_read_byte(buf, (12 + m) as u32);
+              let _ = buf_write_byte(path_buf, m as u32, pb);
+              m = m + 1;
+            }
+            let latest_blk: i64 = dharafs_find_latest_block_raw(path_buf, rec_path_len as i64);
+            if latest_blk == blk {
+              let rec_path_len_i: i64 = rec_path_len as i64;
+              let seg_start: i64 = skip_len;
+              let seg_end: i64 = seg_start;
+              let found_slash: i64 = 0;
+              while (seg_end < rec_path_len_i) && (found_slash == 0) {
+                let c: u32 = buf_read_byte(path_buf, seg_end as u32);
+                if c == (47 as u32) {
+                  found_slash = 1;
+                } else {
+                  seg_end = seg_end + 1;
+                }
+              }
+              let seg_len: i64 = seg_end - seg_start;
+              if query_len > 0 {
+                let is_match: i64 = dharafs_dirlist_segment_equals(query_buf, query_len, path_buf, seg_start, seg_len);
+                if is_match == 1 {
+                  classify_result = if found_slash == 1 { 2 } else { 1 };
+                }
+              } else {
+                if found_slash == 1 {
+                  // Subdirectory -- print its name once, however many
+                  // live files actually sit underneath it.
+                  let already_seen: i64 = dharafs_dirlist_seen_contains(seen, seen_count, path_buf, seg_start, seg_len);
+                  if (already_seen == 0) && (seen_count < 128) {
+                    let _ = dharafs_log_puts("  ");
+                    let p: i64 = seg_start;
+                    while p < seg_end {
+                      let pc: u32 = buf_read_byte(path_buf, p as u32);
+                      let _ = dharafs_log_putc(pc as i64);
+                      p = p + 1;
+                    }
+                    let _ = dharafs_log_puts("/\n");
+                    let slot_off: i64 = seen_count * 32;
+                    let _ = buf_write_byte(seen, slot_off as u32, seg_len as u32);
+                    let q: i64 = 0;
+                    while q < seg_len {
+                      let sc: u32 = buf_read_byte(path_buf, (seg_start + q) as u32);
+                      let _ = buf_write_byte(seen, (slot_off + 1 + q) as u32, sc);
+                      q = q + 1;
+                    }
+                    seen_count = seen_count + 1;
+                  }
+                } else {
+                  // Leaf file directly in this directory.
+                  let _ = dharafs_log_puts("  ");
+                  let p: i64 = seg_start;
+                  while p < seg_end {
+                    let pc: u32 = buf_read_byte(path_buf, p as u32);
+                    let _ = dharafs_log_putc(pc as i64);
+                    p = p + 1;
+                  }
+                  let _ = dharafs_log_puts("\n");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return classify_result;
+}
+
+fn dharafs_list_dir(dir: Str) -> i64 {
+  let dir_len: i64 = str_len_bytes(dir);
+  if dir_len > 32 {
+    return 1;
+  }
+  let dir_buf: mut ref i64 = dharafs_dir_scratch_get();
+  let i: i64 = 0;
+  while i < dir_len {
+    let _ = buf_write_byte(dir_buf, i as u32, str_byte_at(dir, i) as u32);
+    i = i + 1;
+  }
+  let dummy: mut ref i64 = dharafs_stat_scratch_get();
+  return dharafs_list_dir_raw(dir_buf, dir_len, dummy, 0);
+}
+
+fn dharafs_list_dir_classify(dir: Str, segment: Str) -> i64 {
+  let dir_len: i64 = str_len_bytes(dir);
+  let seg_len: i64 = str_len_bytes(segment);
+  if dir_len > 32 {
+    return 0;
+  }
+  // seg_buf below reuses the 12-byte dharafs_stat_scratch buffer (nothing
+  // else needs a dedicated one just for this) -- plenty for any
+  // realistic single path segment, but genuinely a real cap, not an
+  // arbitrary one, so enforce it rather than silently overrunning.
+  if seg_len > 11 {
+    return 0;
+  }
+  let dir_buf: mut ref i64 = dharafs_dir_scratch_get();
+  let i: i64 = 0;
+  while i < dir_len {
+    let _ = buf_write_byte(dir_buf, i as u32, str_byte_at(dir, i) as u32);
+    i = i + 1;
+  }
+  let seg_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let j: i64 = 0;
+  while j < seg_len {
+    let _ = buf_write_byte(seg_buf, j as u32, str_byte_at(segment, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_list_dir_raw(dir_buf, dir_len, seg_buf, seg_len);
+}
+
+fn dharafs_permissions_self_test() -> i64 {
+  let ok: i64 = 1;
+  let _ = dharafs_user_set(0 as u32, 0 as u32); // start as root, the default
+
+  let _ = dharafs_append("/perm/rootfile", "secret"); // root, default mode 0o644
+
+  let path1: Str = "/perm/rootfile";
+  let path1_len: i64 = str_len_bytes(path1);
+
+  // Non-root, non-owning-group user: mode 644's other-read bit allows
+  // reading...
+  let _ = dharafs_user_set(100 as u32, 100 as u32);
+  let path1_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i1: i64 = 0;
+  while i1 < path1_len {
+    let _ = buf_write_byte(path1_buf, i1 as u32, str_byte_at(path1, i1) as u32);
+    i1 = i1 + 1;
+  }
+  let read_buf: mut ref i64 = dharafs_alloc_bytes(64);
+  let read_status: i64 = dharafs_read_raw_checked(path1_buf, path1_len, read_buf, 100 as u32, 100 as u32);
+  if read_status < 0 {
+    ok = 0;
+  }
+
+  // ...but 644 has no other-write bit, so writing is denied.
+  let data1: Str = "hacked";
+  let data1_len: i64 = str_len_bytes(data1);
+  let data1_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j1: i64 = 0;
+  while j1 < data1_len {
+    let _ = buf_write_byte(data1_buf, j1 as u32, str_byte_at(data1, j1) as u32);
+    j1 = j1 + 1;
+  }
+  let write_status: i64 = dharafs_write_raw_checked(path1_buf, path1_len, data1_buf, data1_len, 100 as u32, 100 as u32);
+  if write_status != (0 - 2) {
+    ok = 0;
+  }
+
+  // Deletion needs write permission too -- also denied.
+  let del_status: i64 = dharafs_delete_raw_checked(path1_buf, path1_len, 100 as u32, 100 as u32);
+  if del_status != (0 - 2) {
+    ok = 0;
+  }
+
+  // A brand-new path has no existing owner to be denied by -- non-root
+  // creation succeeds, and the new file's owner is the REQUESTER
+  // (100), not incidentally root, proving dharafs_write_raw_checked's
+  // new-file default actually uses its req_uid/req_gid parameters.
+  let path2: Str = "/perm/userfile";
+  let path2_len: i64 = str_len_bytes(path2);
+  let path2_buf: mut ref i64 = dharafs_dir_scratch_get();
+  let i2: i64 = 0;
+  while i2 < path2_len {
+    let _ = buf_write_byte(path2_buf, i2 as u32, str_byte_at(path2, i2) as u32);
+    i2 = i2 + 1;
+  }
+  let data2: Str = "mine";
+  let data2_len: i64 = str_len_bytes(data2);
+  let data2_buf: mut ref i64 = dharafs_alloc_bytes(16);
+  let j2: i64 = 0;
+  while j2 < data2_len {
+    let _ = buf_write_byte(data2_buf, j2 as u32, str_byte_at(data2, j2) as u32);
+    j2 = j2 + 1;
+  }
+  let create_status: i64 = dharafs_write_raw_checked(path2_buf, path2_len, data2_buf, data2_len, 100 as u32, 100 as u32);
+  if create_status != 0 {
+    ok = 0;
+  }
+  let meta_check: mut ref i64 = dharafs_alloc_bytes(12);
+  let stat_check: i64 = dharafs_stat("/perm/userfile", meta_check);
+  if stat_check != 0 {
+    ok = 0;
+  }
+  if buf_read_u32(meta_check, 0 as u32) != (100 as u32) {
+    ok = 0;
+  }
+
+  // Root bypasses every check regardless of mode.
+  let _ = dharafs_user_set(0 as u32, 0 as u32);
+  let path1_buf_r: mut ref i64 = dharafs_path_scratch_get();
+  let i3: i64 = 0;
+  while i3 < path1_len {
+    let _ = buf_write_byte(path1_buf_r, i3 as u32, str_byte_at(path1, i3) as u32);
+    i3 = i3 + 1;
+  }
+  let data1_buf_r: mut ref i64 = dharafs_data_scratch_get();
+  let j3: i64 = 0;
+  while j3 < data1_len {
+    let _ = buf_write_byte(data1_buf_r, j3 as u32, str_byte_at(data1, j3) as u32);
+    j3 = j3 + 1;
+  }
+  let root_write_status: i64 = dharafs_write_raw_checked(path1_buf_r, path1_len, data1_buf_r, data1_len, 0 as u32, 0 as u32);
+  if root_write_status != 0 {
+    ok = 0;
+  }
+
+  // dharafs_chmod loosens rootfile to world-writable (0o666 = 438 decimal);
+  // the same non-root write that was denied above now succeeds.
+  let _ = dharafs_chmod("/perm/rootfile", 438 as u32);
+  let _ = dharafs_user_set(100 as u32, 100 as u32);
+  let path1_buf2: mut ref i64 = dharafs_path_scratch_get();
+  let i4: i64 = 0;
+  while i4 < path1_len {
+    let _ = buf_write_byte(path1_buf2, i4 as u32, str_byte_at(path1, i4) as u32);
+    i4 = i4 + 1;
+  }
+  let data1_buf2: mut ref i64 = dharafs_data_scratch_get();
+  let j4: i64 = 0;
+  while j4 < data1_len {
+    let _ = buf_write_byte(data1_buf2, j4 as u32, str_byte_at(data1, j4) as u32);
+    j4 = j4 + 1;
+  }
+  let write_status2: i64 = dharafs_write_raw_checked(path1_buf2, path1_len, data1_buf2, data1_len, 100 as u32, 100 as u32);
+  if write_status2 != 0 {
+    ok = 0;
+  }
+
+  // Restore the default root context so later self-tests/the shell
+  // don't inherit this test's leftover non-root session.
+  let _ = dharafs_user_set(0 as u32, 0 as u32);
+
+  let _ = dharafs_log_puts("DharaFS: permission model (owner/group/other rwx, root bypass, chmod) enforces read/write/delete correctly");
+  if ok == 1 {
+    let _ = dharafs_log_puts(" (PASS)\n");
+  } else {
+    let _ = dharafs_log_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+fn dharafs_directory_hierarchy_self_test() -> i64 {
+  let ok: i64 = 1;
+  let _ = dharafs_append("/docs/readme", "hello");
+  let _ = dharafs_append("/docs/notes", "abc");
+  let _ = dharafs_append("/docs/sub/deep", "nested");
+
+  if dharafs_list_dir_classify("/docs", "readme") != 1 {
+    ok = 0;
+  }
+  if dharafs_list_dir_classify("/docs", "notes") != 1 {
+    ok = 0;
+  }
+  if dharafs_list_dir_classify("/docs", "sub") != 2 {
+    ok = 0;
+  }
+  // "deep" lives under /docs/sub, not directly under /docs -- must
+  // NOT show up as an entry of /docs itself.
+  if dharafs_list_dir_classify("/docs", "deep") != 0 {
+    ok = 0;
+  }
+  // Querying the actual subdirectory directly finds its own leaf file.
+  if dharafs_list_dir_classify("/docs/sub", "deep") != 1 {
+    ok = 0;
+  }
+  // Root-level listing: /docs itself is a top-level directory.
+  if dharafs_list_dir_classify("", "docs") != 2 {
+    ok = 0;
+  }
+
+  let _ = dharafs_log_puts("DharaFS: directory hierarchy (dharafs_list_dir) distinguishes files from subdirectories");
+  if ok == 1 {
+    let _ = dharafs_log_puts(" (PASS)\n");
+  } else {
+    let _ = dharafs_log_puts(" (FAIL)\n");
+  }
+  return 0;
+}
+
+fn dharafs_list(prefix: Str) -> i64 {
+  let prefix_len: i64 = str_len_bytes(prefix);
+  let next_block: u32 = dharafs_state_get_next_block();
+  let log_start: u32 = dharafs_state_get_log_start();
+  let buf: mut ref i64 = dharafs_sd_scratch_get();
+  let blk: i64 = log_start as i64;
+  while (blk as u32) < next_block {
+    let rd_status: i64 = dharafs_block_read(blk, buf);
+    if rd_status == 0 {
+      let stored_checksum: u32 = buf_read_u32(buf, 0 as u32);
+      let computed_checksum: u32 = buf_checksum(buf, 4 as u32, 508 as u32);
+      let rec_seq: u32 = buf_read_u32(buf, 4 as u32);
+      if (stored_checksum == computed_checksum) && (rec_seq != (0 as u32)) {
+        let rec_path_len: u32 = buf_read_u32(buf, 8 as u32);
+        let rec_data_len: u32 = buf_read_u32(buf, 44 as u32);
+        let long_enough: i64 = 0;
+        // Round 39: rec_path_len == 0 marks a continuation block (see
+        // dharafs_init's own header comment), never independently listable
+        // -- excluded explicitly rather than relying on the >=
+        // prefix_len check below to happen to exclude it (it wouldn't,
+        // for an empty "list everything" prefix, prefix_len == 0 too).
+        if (rec_path_len > (0 as u32)) && ((rec_path_len as i64) >= prefix_len) {
+          long_enough = 1;
+        }
+        if (long_enough == 1) && (rec_data_len != (0xFFFFFFFF as u32)) {
+          let prefix_matches: i64 = 1;
+          let k: i64 = 0;
+          while k < prefix_len {
+            let want: i64 = str_byte_at(prefix, k);
+            let got: u32 = buf_read_byte(buf, (12 + k) as u32);
+            if (got as i64) != want {
+              prefix_matches = 0;
+            }
+            k = k + 1;
+          }
+          // BUG (found via audit, 2026-08-27): rec_path_len feeds the
+          // copy loop below with only a checksum match backing it --
+          // strong evidence against corruption, not proof (see dharafs_
+          // compact's identical fix for the full reasoning). Reject
+          // rather than let an out-of-range length overflow dharafs_path_
+          // scratch's real 32-byte capacity.
+          if (prefix_matches == 1) && (rec_path_len <= (32 as u32)) {
+            // Copy the path out before calling dharafs_find_latest_block_
+            // raw below: it reuses dharafs_sd_scratch (the same persistent
+            // buffer as `buf` above) for its own scan, so `buf`'s
+            // current record is only safe to keep reading from up to
+            // this point -- everything this branch still needs from it
+            // (rec_path_len, and now these bytes) has to be pulled out
+            // first. path_buf itself is a separate persistent buffer
+            // (dharafs_path_scratch), untouched by that scan.
+            let path_buf: mut ref i64 = dharafs_path_scratch_get();
+            let m: i64 = 0;
+            while (m as u32) < rec_path_len {
+              let pb: u32 = buf_read_byte(buf, (12 + m) as u32);
+              let _ = buf_write_byte(path_buf, m as u32, pb);
+              m = m + 1;
+            }
+            let latest_blk: i64 = dharafs_find_latest_block_raw(path_buf, rec_path_len as i64);
+            if latest_blk == blk {
+              let _ = dharafs_log_puts("  ");
+              let p: i64 = 0;
+              while (p as u32) < rec_path_len {
+                let pc: u32 = buf_read_byte(path_buf, p as u32);
+                let _ = dharafs_log_putc(pc as i64);
+                p = p + 1;
+              }
+              let _ = dharafs_log_puts("\n");
+            }
+          }
+        }
+      }
+    }
+    blk = blk + 1;
+  }
+  return 0;
+}
+
+fn dharafs_print_data(buf: mut ref i64, byte_len: i64) -> i64 {
+  let i: i64 = 0;
+  while i < byte_len {
+    let b: u32 = buf_read_byte(buf, i as u32);
+    let _ = dharafs_log_putc(b as i64);
+    i = i + 1;
+  }
+  return 0;
+}
+
+// The upstream AEAD per-block metadata subsystem (write-counter + tag,
+// blocks 4000+) is NOT included here: its only callers are the
+// crypto-tier dharafs_crypto_encrypt_block/decrypt_block
+// implementations, which this package deliberately excludes (see
+// header comment) in favor of treating those two as a plain
+// consumer-provided extern hook. A consumer that wants tamper-
+// detected media encryption implements that bookkeeping behind its
+// own encrypt_block/decrypt_block, same as everything else in the
+// hook contract.

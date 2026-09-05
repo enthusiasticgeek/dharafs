@@ -4,7 +4,7 @@ version     = "0.1.0"
 entry       = "src/lib.vani"
 authors     = "enthusiasticgeek"
 license     = "Apache-2.0"
-description = "Kernel-agnostic log-structured filesystem: append-only records, checksums, permissions/attributes, rename+transactions, a hashed directory index, and snapshots. Extracted from Dhruva OS. Requires the consuming kernel to provide block I/O, an allocator, and a logging sink -- see README.md."
+description = "Kernel-agnostic log-structured filesystem: append-only records, checksums, permissions/attributes, rename+transactions, a hashed directory index, and snapshots. Extracted from Dhruva OS. Requires the consuming kernel to provide block I/O, an allocator, and a logging sink -- see README.md. Optional Tier 2 add-on (src/lib_tier2.vani): real ChaCha20-Poly1305 AEAD media encryption + SHA-256-verified companion-file I/O, nothing left to implement yourself."
 registry    = "kosh"
 
 [deps]

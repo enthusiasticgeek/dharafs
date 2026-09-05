@@ -1,0 +1,20 @@
+// DharaFS -- Tier 2 entry point: core filesystem + real ChaCha20-
+// Poly1305 AEAD media encryption + SHA-256-verified companion-file
+// I/O, all built in. Nothing left for a consumer to implement beyond
+// the same 6 environment-specific seams Tier 1 already needs (block
+// I/O, allocator, logging) -- media_crypto.vani/verified_io.vani's own
+// scratch state is provided by this package's own runtime files.
+//
+// Link: runtime/dharafs_runtime.c, runtime/dharafs_crypto_runtime.c,
+// runtime/dharafs_media_crypto_runtime.c,
+// runtime/dharafs_verified_io_runtime.c. See test/host_test_tier2.vani
+// for a full worked example.
+//
+// Want only one of the two additions, not both? Use
+// "./lib_encrypted.vani" (media encryption only) or
+// "./lib_verified.vani" (verified I/O only) instead -- see README.md.
+
+use "./core.vani";
+use "./crypto.vani";
+use "./media_crypto.vani";
+use "./verified_io.vani";

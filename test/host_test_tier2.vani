@@ -1,0 +1,354 @@
+// DharaFS Tier 2 test suite: crypto primitive known-answer tests
+// (ground truth generated via Python's hashlib/hmac and the real
+// `cryptography` library -- see the generation script referenced in
+// this repo's own development notes, not hand-derived), plus real
+// round-trip / tamper-detection / composition tests for media
+// encryption and verified I/O built on top of the primitives.
+//
+// Run with:
+//   vanic run test/host_test_tier2.vani --backend=c \
+//     --link-with runtime/dharafs_runtime.c \
+//     --link-with runtime/dharafs_crypto_runtime.c \
+//     --link-with runtime/dharafs_media_crypto_runtime.c \
+//     --link-with runtime/dharafs_verified_io_runtime.c \
+//     --link-with test/host_stubs.c
+
+use "../src/lib_tier2.vani";
+
+fn hex_ascii_to_nibble(c: u32) -> u32 {
+  if (c >= (0x30 as u32)) && (c <= (0x39 as u32)) {
+    return c - (0x30 as u32);
+  }
+  if (c >= (0x61 as u32)) && (c <= (0x66 as u32)) {
+    return (c - (0x61 as u32)) + (10 as u32);
+  }
+  if (c >= (0x41 as u32)) && (c <= (0x46 as u32)) {
+    return (c - (0x41 as u32)) + (10 as u32);
+  }
+  return 0 as u32;
+}
+
+fn write_hex_string(dst: mut ref i64, hex: Str, byte_count: i64) -> i64 {
+  let i: i64 = 0;
+  while i < byte_count {
+    let hi: u32 = hex_ascii_to_nibble(str_byte_at(hex, i * 2) as u32);
+    let lo: u32 = hex_ascii_to_nibble(str_byte_at(hex, (i * 2) + 1) as u32);
+    let _ = buf_write_byte(dst, i as u32, (hi << (4 as u32)) | lo);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn main() -> i64 {
+  // ---- SHA-256 known-answer tests ----
+  {
+    let out: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp: mut ref i64 = dharafs_alloc_bytes(32);
+    let empty: mut ref i64 = dharafs_alloc_bytes(1);
+    let _ = sha256_hash(empty, 0, out);
+    let _ = write_hex_string(exp, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 32);
+    assert sha256_bytes_equal(out, exp, 32) == 1;
+  }
+  {
+    let msg: mut ref i64 = dharafs_alloc_bytes(3);
+    let _ = str_copy_to_buf("abc", msg);
+    let out: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = sha256_hash(msg, 3, out);
+    let _ = write_hex_string(exp, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 32);
+    assert sha256_bytes_equal(out, exp, 32) == 1;
+  }
+  {
+    // 56-byte message: the exact padding boundary where the length
+    // field no longer fits in the first 64-byte block.
+    let msg: mut ref i64 = dharafs_alloc_bytes(56);
+    let i: i64 = 0;
+    while i < 56 {
+      let _ = buf_write_byte(msg, i as u32, 97 as u32); // 'a'
+      i = i + 1;
+    }
+    let out: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = sha256_hash(msg, 56, out);
+    let _ = write_hex_string(exp, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a", 32);
+    assert sha256_bytes_equal(out, exp, 32) == 1;
+  }
+  {
+    // 100-byte message (bytes 0..99): exercises the multi-block path.
+    let msg: mut ref i64 = dharafs_alloc_bytes(100);
+    let i: i64 = 0;
+    while i < 100 {
+      let _ = buf_write_byte(msg, i as u32, i as u32);
+      i = i + 1;
+    }
+    let out: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = sha256_hash(msg, 100, out);
+    let _ = write_hex_string(exp, "bce0aff19cf5aa6a7469a30d61d04e4376e4bbf6381052ee9e7f33925c954d52", 32);
+    assert sha256_bytes_equal(out, exp, 32) == 1;
+  }
+
+  // ---- HMAC-SHA256 known-answer test ----
+  {
+    let key: mut ref i64 = dharafs_alloc_bytes(3);
+    let _ = str_copy_to_buf("key", key);
+    let msg: mut ref i64 = dharafs_alloc_bytes(43);
+    let _ = str_copy_to_buf("The quick brown fox jumps over the lazy dog", msg);
+    let out: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = hmac_sha256(key, 3, msg, 43, out);
+    let _ = write_hex_string(exp, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", 32);
+    assert hmac_sha256_bytes_equal(out, exp, 32) == 1;
+  }
+
+  // ---- PBKDF2-HMAC-SHA256 known-answer tests (iterations 1, 2, 4096) ----
+  {
+    let password: mut ref i64 = dharafs_alloc_bytes(8);
+    let _ = str_copy_to_buf("password", password);
+    let salt: mut ref i64 = dharafs_alloc_bytes(4);
+    let _ = str_copy_to_buf("salt", salt);
+
+    let out1: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp1: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = pbkdf2_hmac_sha256(password, 8, salt, 4, 1, out1);
+    let _ = write_hex_string(exp1, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b", 32);
+    assert hmac_sha256_bytes_equal(out1, exp1, 32) == 1;
+
+    let out2: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp2: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = pbkdf2_hmac_sha256(password, 8, salt, 4, 2, out2);
+    let _ = write_hex_string(exp2, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43", 32);
+    assert hmac_sha256_bytes_equal(out2, exp2, 32) == 1;
+
+    let out3: mut ref i64 = dharafs_alloc_bytes(32);
+    let exp3: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = pbkdf2_hmac_sha256(password, 8, salt, 4, 4096, out3);
+    let _ = write_hex_string(exp3, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a", 32);
+    assert hmac_sha256_bytes_equal(out3, exp3, 32) == 1;
+  }
+
+  // ---- ChaCha20-Poly1305 AEAD known-answer test (vs the real
+  // `cryptography` library), plus tamper detection on both the tag
+  // and the ciphertext ----
+  {
+    let key: mut ref i64 = dharafs_alloc_bytes(32);
+    let _ = write_hex_string(key, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", 32);
+    let nonce: mut ref i64 = dharafs_alloc_bytes(12);
+    let _ = write_hex_string(nonce, "000102030405060708090a0b", 12);
+    let aad: mut ref i64 = dharafs_alloc_bytes(8);
+    let _ = write_hex_string(aad, "0000000000000007", 8);
+    let plaintext: mut ref i64 = dharafs_alloc_bytes(46);
+    let _ = write_hex_string(plaintext, "44686172614653205469657220322041454144206b6e6f776e2d616e73776572207465737420766563746f722121", 46);
+    let exp_ciphertext: mut ref i64 = dharafs_alloc_bytes(46);
+    let _ = write_hex_string(exp_ciphertext, "cd9369724851f660e3ea5a81b82f2e228c31f6c73a1ac2ce88ba4eab06b7c34eccf44980923ec7fd544619aa44b5", 46);
+    let exp_tag: mut ref i64 = dharafs_alloc_bytes(16);
+    let _ = write_hex_string(exp_tag, "8c1ec836c81126913e35a96d6cbec77c", 16);
+
+    let state_buf: mut ref i64 = dharafs_alloc_bytes(64);
+    let working_buf: mut ref i64 = dharafs_alloc_bytes(64);
+    let keystream_buf: mut ref i64 = dharafs_alloc_bytes(64);
+    let block_scratch: mut ref i64 = dharafs_alloc_bytes(16);
+    let otk_scratch: mut ref i64 = dharafs_alloc_bytes(32);
+    let mac_data_scratch: mut ref i64 = dharafs_alloc_bytes(128);
+
+    let ciphertext: mut ref i64 = dharafs_alloc_bytes(46);
+    let tag: mut ref i64 = dharafs_alloc_bytes(16);
+    let _ = chacha20_poly1305_encrypt(key, nonce, aad, 8, plaintext, 46,
+                                       state_buf, working_buf, keystream_buf,
+                                       block_scratch, otk_scratch, mac_data_scratch,
+                                       ciphertext, tag);
+    assert chacha20_bytes_equal(ciphertext, exp_ciphertext, 46) == 1;
+    assert chacha20_bytes_equal(tag, exp_tag, 16) == 1;
+
+    let decrypted: mut ref i64 = dharafs_alloc_bytes(46);
+    let dec_status: i64 = chacha20_poly1305_decrypt(key, nonce, aad, 8, ciphertext, 46, tag,
+                                                     state_buf, working_buf, keystream_buf,
+                                                     block_scratch, otk_scratch, mac_data_scratch,
+                                                     dharafs_alloc_bytes(16), decrypted);
+    assert dec_status == 0;
+    assert chacha20_bytes_equal(decrypted, plaintext, 46) == 1;
+
+    // Tamper the tag: flip one bit, decrypt must reject (-1), not
+    // silently "succeed" into garbage.
+    let bad_tag: mut ref i64 = dharafs_alloc_bytes(16);
+    let k: i64 = 0;
+    while k < 16 {
+      let _ = buf_write_byte(bad_tag, k as u32, buf_read_byte(tag, k as u32));
+      k = k + 1;
+    }
+    let _ = buf_write_byte(bad_tag, 0 as u32, (buf_read_byte(bad_tag, 0 as u32) ^ (1 as u32)));
+    let bad_tag_status: i64 = chacha20_poly1305_decrypt(key, nonce, aad, 8, ciphertext, 46, bad_tag,
+                                                         state_buf, working_buf, keystream_buf,
+                                                         block_scratch, otk_scratch, mac_data_scratch,
+                                                         dharafs_alloc_bytes(16), dharafs_alloc_bytes(46));
+    assert bad_tag_status == (0 - 1);
+
+    // Tamper the ciphertext instead (original tag): must also reject.
+    let bad_ct: mut ref i64 = dharafs_alloc_bytes(46);
+    let m: i64 = 0;
+    while m < 46 {
+      let _ = buf_write_byte(bad_ct, m as u32, buf_read_byte(ciphertext, m as u32));
+      m = m + 1;
+    }
+    let _ = buf_write_byte(bad_ct, 0 as u32, (buf_read_byte(bad_ct, 0 as u32) ^ (1 as u32)));
+    let bad_ct_status: i64 = chacha20_poly1305_decrypt(key, nonce, aad, 8, bad_ct, 46, tag,
+                                                        state_buf, working_buf, keystream_buf,
+                                                        block_scratch, otk_scratch, mac_data_scratch,
+                                                        dharafs_alloc_bytes(16), dharafs_alloc_bytes(46));
+    assert bad_ct_status == (0 - 1);
+  }
+
+  // ---- Media encryption: key-not-initialized safety, real
+  // encrypt/decrypt round trip, two-time-pad fix, tamper detection,
+  // and the off-by-default / on/off toggle ----
+  let init_status: i64 = dharafs_init();
+  assert init_status == 0;
+
+  {
+    // Before key_init: encrypt_block must fail closed, not silently
+    // encrypt with an all-zero key.
+    let plaintext: mut ref i64 = dharafs_alloc_bytes(512);
+    let ciphertext: mut ref i64 = dharafs_alloc_bytes(512);
+    let status: i64 = dharafs_crypto_encrypt_block(3000, plaintext, ciphertext);
+    assert status == (0 - 2);
+  }
+
+  let key_init_status: i64 = dharafs_crypto_key_init("test-passphrase-not-for-production", "test-salt", 1000);
+  assert key_init_status == 0;
+
+  assert dharafs_crypto_get_enabled() == (0 as u32); // off by default even after key_init
+
+  {
+    let test_block: i64 = 3000;
+    let plaintext: mut ref i64 = dharafs_alloc_bytes(512);
+    let i: i64 = 0;
+    while i < 512 {
+      let _ = buf_write_byte(plaintext, i as u32, ((i * 7 + 11) & 255) as u32);
+      i = i + 1;
+    }
+
+    let ciphertext: mut ref i64 = dharafs_alloc_bytes(512);
+    let enc_status: i64 = dharafs_crypto_encrypt_block(test_block, plaintext, ciphertext);
+    assert enc_status == 0;
+    assert chacha20_bytes_equal(ciphertext, plaintext, 512) == 0; // really encrypted, not identity
+
+    let decrypted: mut ref i64 = dharafs_alloc_bytes(512);
+    let dec_status: i64 = dharafs_crypto_decrypt_block(test_block, ciphertext, decrypted);
+    assert dec_status == 0;
+    assert chacha20_bytes_equal(decrypted, plaintext, 512) == 1;
+
+    // Two-time-pad fix: encrypting the SAME block again must produce
+    // a DIFFERENT ciphertext (the per-block write-counter advances),
+    // and both must still decrypt correctly.
+    let ciphertext2: mut ref i64 = dharafs_alloc_bytes(512);
+    let enc2_status: i64 = dharafs_crypto_encrypt_block(test_block, plaintext, ciphertext2);
+    assert enc2_status == 0;
+    assert chacha20_bytes_equal(ciphertext, ciphertext2, 512) == 0;
+    let decrypted2: mut ref i64 = dharafs_alloc_bytes(512);
+    let dec2_status: i64 = dharafs_crypto_decrypt_block(test_block, ciphertext2, decrypted2);
+    assert dec2_status == 0;
+    assert chacha20_bytes_equal(decrypted2, plaintext, 512) == 1;
+
+    // Tamper detection: flip a ciphertext byte, decrypt must reject.
+    let tampered: mut ref i64 = dharafs_alloc_bytes(512);
+    let t: i64 = 0;
+    while t < 512 {
+      let _ = buf_write_byte(tampered, t as u32, buf_read_byte(ciphertext2, t as u32));
+      t = t + 1;
+    }
+    let _ = buf_write_byte(tampered, 100 as u32, (buf_read_byte(tampered, 100 as u32) ^ (1 as u32)));
+    let tamper_status: i64 = dharafs_crypto_decrypt_block(test_block, tampered, dharafs_alloc_bytes(512));
+    assert tamper_status == (0 - 1);
+
+    // A block with no metadata entry at all (never AEAD-protected) is
+    // honest passthrough, not a failure -- e.g. a fresh block.
+    let fresh_block: i64 = 3001;
+    let fresh_ciphertext: mut ref i64 = dharafs_alloc_bytes(512);
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(fresh_ciphertext, z as u32, ((z * 13 + 3) & 255) as u32);
+      z = z + 1;
+    }
+    let fresh_out: mut ref i64 = dharafs_alloc_bytes(512);
+    let fresh_status: i64 = dharafs_crypto_decrypt_block(fresh_block, fresh_ciphertext, fresh_out);
+    assert fresh_status == 0;
+    assert chacha20_bytes_equal(fresh_out, fresh_ciphertext, 512) == 1; // passthrough, unchanged
+  }
+
+  // ---- Full block-write/read integration: enabling encryption makes
+  // dharafs_block_read/write transparently encrypt at rest, while
+  // dharafs_block_read_raw (bypassing the hook) shows real ciphertext. ----
+  {
+    let _ = dharafs_crypto_set_enabled(1 as u32);
+    let target_block: i64 = 3002;
+    let plaintext: mut ref i64 = dharafs_alloc_bytes(512);
+    let i: i64 = 0;
+    while i < 512 {
+      let _ = buf_write_byte(plaintext, i as u32, ((i * 5 + 1) & 255) as u32);
+      i = i + 1;
+    }
+    let write_status: i64 = dharafs_block_write(target_block, plaintext);
+    assert write_status == 0;
+
+    let raw_bytes: mut ref i64 = dharafs_alloc_bytes(512);
+    let raw_status: i64 = dharafs_block_read_raw(target_block, raw_bytes);
+    assert raw_status == 0;
+    assert chacha20_bytes_equal(raw_bytes, plaintext, 512) == 0; // on-disk bytes are ciphertext
+
+    let read_back: mut ref i64 = dharafs_alloc_bytes(512);
+    let read_status: i64 = dharafs_block_read(target_block, read_back);
+    assert read_status == 0;
+    assert chacha20_bytes_equal(read_back, plaintext, 512) == 1; // transparent decryption
+
+    // Whole-file round trip through the ordinary Str-based API while
+    // encryption is on -- proves the encryption layer is invisible to
+    // every higher FS layer, not just the raw block primitives above.
+    let append_status: i64 = dharafs_append("secret.txt", "top secret data, encrypted at rest");
+    assert append_status == 0;
+    let out_buf: mut ref i64 = dharafs_alloc_bytes(4096);
+    let read_len: i64 = dharafs_read("secret.txt", out_buf);
+    assert read_len == 34; // str_len_bytes("top secret data, encrypted at rest")
+    assert buf_read_byte(out_buf, 0 as u32) == (116 as u32); // 't'
+
+    let _ = dharafs_crypto_set_enabled(0 as u32); // restore: off, matching every other test's own expectation
+  }
+
+  // ---- Verified I/O: round trip, then tamper detection when a file
+  // is modified through a path that bypasses the verified digest ----
+  {
+    let write_status: i64 = dharafs_write_verified("v.txt", "verified content v1");
+    assert write_status == 0;
+    let buf: mut ref i64 = dharafs_alloc_bytes(4096);
+    let read_len: i64 = dharafs_read_verified("v.txt", buf);
+    assert read_len == 19; // str_len_bytes("verified content v1")
+    assert buf_read_byte(buf, 0 as u32) == (118 as u32); // 'v'
+
+    // Bypass the verified path: append new content directly (the
+    // digest companion file is NOT updated by this call), simulating
+    // tampering/corruption of the data file independent of its
+    // digest.
+    let corrupt_status: i64 = dharafs_append("v.txt", "corrupted content, digest now stale!");
+    assert corrupt_status == 0;
+    let tampered_len: i64 = dharafs_read_verified("v.txt", buf);
+    assert tampered_len == (0 - 3); // digest mismatch detected
+  }
+
+  // ---- Composition: verified I/O + media encryption enabled at the
+  // same time. The digest is computed over plaintext regardless of
+  // whether the underlying blocks are encrypted at rest -- this
+  // exercises that composition for real, not just by architectural
+  // argument. ----
+  {
+    let _ = dharafs_crypto_set_enabled(1 as u32);
+    let write_status: i64 = dharafs_write_verified("both.txt", "encrypted and verified together");
+    assert write_status == 0;
+    let buf: mut ref i64 = dharafs_alloc_bytes(4096);
+    let read_len: i64 = dharafs_read_verified("both.txt", buf);
+    assert read_len == 31; // str_len_bytes("encrypted and verified together")
+    assert buf_read_byte(buf, 0 as u32) == (101 as u32); // 'e'
+    let _ = dharafs_crypto_set_enabled(0 as u32);
+  }
+
+  let _ = dharafs_log_puts("DharaFS Tier 2 test suite: PASS\n");
+  return 0;
+}

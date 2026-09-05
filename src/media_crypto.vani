@@ -1,0 +1,256 @@
+// DharaFS media (at-rest) encryption: real ChaCha20-Poly1305 AEAD,
+// completing the extern hook src/lib.vani (Tier 1) leaves pluggable.
+// Ported from Dhruva OS's own kernel/kernel_main.vani (round 69),
+// where this exact scheme replaced an earlier, honestly-documented
+// weaker design (see this file's own comments below for what that
+// weakness was and how it's fixed).
+//
+// Hooked in at core.vani's dharafs_block_read/dharafs_block_write --
+// the single choke point every physical block read/write already
+// passes through -- so every higher FS layer (checksums, headers,
+// journaling, compaction, permissions, dirindex, snapshots) keeps
+// operating on plaintext; only the physical bytes that actually reach
+// dharafs_backend_read_block/_write_block are ciphertext.
+//
+// OFF BY DEFAULT: dharafs_crypto_get_enabled() starts at 0, so linking
+// this file changes nothing for a consumer who never calls
+// dharafs_crypto_set_enabled(1) -- matching core.vani's own
+// dharafs_block_dev toggle precedent and Dhruva OS's own "every
+// existing test keeps running against plaintext blocks unchanged
+// unless something explicitly turns this on" posture.
+//
+// KEY MANAGEMENT, loosely coupled by design: unlike upstream (which
+// hardcodes one fixed passphrase/salt baked into the kernel image --
+// an honest, documented limitation of a project with no hardware key
+// store/TPM), dharafs_crypto_key_init here takes the passphrase, salt,
+// and PBKDF2 iteration count as real parameters. A consumer decides
+// where those come from (a fixed constant, same as upstream, is one
+// valid choice; a user-entered passphrase, a hardware key store, or a
+// key derived some other way are others) -- this package makes no
+// assumption about that decision.
+
+use "./crypto.vani";
+use "./core.vani";
+
+extern "C" fn dharafs_crypto_get_enabled() -> u32;
+extern "C" fn dharafs_crypto_set_enabled(v: u32) -> u32;
+extern "C" fn dharafs_crypto_key_initialized_get() -> u32;
+extern "C" fn dharafs_crypto_key_initialized_set(v: u32) -> u32;
+
+extern "C" fn dharafs_crypto_key_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_nonce_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_state_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_working_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_keystream_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_block_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_otk_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_mac_data_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_tag_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_computed_tag_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_aad_scratch_ptr() -> mut ref i64;
+extern "C" fn dharafs_crypto_meta_sector_scratch_ptr() -> mut ref i64;
+
+// Per-block AEAD metadata (write-counter + Poly1305 tag): a dedicated
+// region starting at block 4000 (clear of DharaFS's own log region,
+// blocks 1-2048), 16 fixed 32-byte entries packed per 512-byte sector
+// -- one entry per tracked data block: 4-byte write-counter (BE) +
+// 4-byte magic ("DHAC", distinguishes a real entry from an
+// uninitialized/garbage sector on a fresh or foreign disk) + 16-byte
+// tag + 8 reserved bytes. A missing/absent-magic entry means "this
+// block has never been AEAD-protected" (predates encryption being
+// turned on, or was written while it was off) -- the read path falls
+// through to plain passthrough for it rather than rejecting genuine,
+// pre-existing plaintext. This metadata is itself stored in the clear
+// (it holds no secret, only a public counter and a MAC tag) --
+// keeping it unencrypted avoids a chicken-and-egg dependency on itself.
+fn dharafs_crypto_meta_sector_for(block_num: i64) -> i64 {
+  return 4000 + (block_num / 16);
+}
+
+fn dharafs_crypto_meta_offset_for(block_num: i64) -> i64 {
+  return (block_num % 16) * 32;
+}
+
+// Returns the block's current write-counter, or 0 if this block has
+// never been AEAD-protected (no entry, or a garbage/foreign sector
+// whose magic doesn't match).
+fn dharafs_crypto_meta_read_counter(block_num: i64) -> i64 {
+  let sector: mut ref i64 = dharafs_crypto_meta_sector_scratch_ptr();
+  let status: i64 = dharafs_block_read_raw(dharafs_crypto_meta_sector_for(block_num), sector);
+  if status != 0 {
+    return 0;
+  }
+  let off: i64 = dharafs_crypto_meta_offset_for(block_num);
+  let magic: u32 = buf_read_u32_be(sector, off + 4);
+  if magic != (0x44484143 as u32) {
+    return 0;
+  }
+  return buf_read_u32_be(sector, off) as i64;
+}
+
+// Reads the block's stored tag into out_tag (16 bytes). Only
+// meaningful when dharafs_crypto_meta_read_counter(block_num) != 0 --
+// callers must check that first.
+fn dharafs_crypto_meta_read_tag(block_num: i64, out_tag: mut ref i64) -> i64 {
+  let sector: mut ref i64 = dharafs_crypto_meta_sector_scratch_ptr();
+  let status: i64 = dharafs_block_read_raw(dharafs_crypto_meta_sector_for(block_num), sector);
+  if status != 0 {
+    return status;
+  }
+  let off: i64 = dharafs_crypto_meta_offset_for(block_num);
+  let i: i64 = 0;
+  while i < 16 {
+    let _ = buf_write_byte(out_tag, i as u32, buf_read_byte(sector, (off + 8 + i) as u32));
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Read-modify-write: updates one 32-byte entry within its 512-byte
+// metadata sector, leaving the other 15 entries in that sector
+// untouched. Zeroes the sector first on its very first use (read
+// failure) rather than writing a new entry through uninitialized
+// storage that would corrupt the other 15 slots.
+fn dharafs_crypto_meta_write_entry(block_num: i64, counter: i64, tag: mut ref i64) -> i64 {
+  let sector: mut ref i64 = dharafs_crypto_meta_sector_scratch_ptr();
+  let sector_num: i64 = dharafs_crypto_meta_sector_for(block_num);
+  let read_status: i64 = dharafs_block_read_raw(sector_num, sector);
+  if read_status != 0 {
+    let z: i64 = 0;
+    while z < 512 {
+      let _ = buf_write_byte(sector, z as u32, 0 as u32);
+      z = z + 1;
+    }
+  }
+  let off: i64 = dharafs_crypto_meta_offset_for(block_num);
+  let _ = buf_write_u32_be(sector, off, counter as u32);
+  let _ = buf_write_u32_be(sector, off + 4, 0x44484143 as u32);
+  let i: i64 = 0;
+  while i < 16 {
+    let _ = buf_write_byte(sector, (off + 8 + i) as u32, buf_read_byte(tag, i as u32));
+    i = i + 1;
+  }
+  return dharafs_block_write_raw(sector_num, sector);
+}
+
+// Derives the 32-byte media-encryption key via PBKDF2-HMAC-SHA256 from
+// a consumer-supplied passphrase and salt. Call this once before
+// enabling encryption (dharafs_crypto_set_enabled(1)) -- encrypt_block/
+// decrypt_block both fail closed (see below) rather than silently
+// using an all-zero key if this was never called, so a consumer that
+// forgets this step gets a clean error, not silent data corruption.
+fn dharafs_crypto_key_init(passphrase: Str, salt: Str, iterations: i64) -> i64 {
+  let pass_len: i64 = str_len_bytes(passphrase);
+  let pass_buf: mut ref i64 = dharafs_crypto_scratch_ptr();
+  let _ = str_copy_to_buf(passphrase, pass_buf);
+  let salt_len: i64 = str_len_bytes(salt);
+  let salt_buf: mut ref i64 = dharafs_crypto_keystream_ptr(); // scratch; overwritten on first real use
+  let _ = str_copy_to_buf(salt, salt_buf);
+  let key: mut ref i64 = dharafs_crypto_key_ptr();
+  let _ = pbkdf2_hmac_sha256(pass_buf, pass_len, salt_buf, salt_len, iterations, key);
+  let _ = dharafs_crypto_key_initialized_set(1 as u32);
+  return 0;
+}
+
+// Encrypts one 512-byte block for on-disk storage with ChaCha20-
+// Poly1305 AEAD. Nonce = block_num (4 bytes, BE) || per-block write-
+// counter (4 bytes, BE, read from and re-persisted to the metadata
+// region, incremented on every call) || 4 zero bytes -- the SAME
+// block written twice gets a DIFFERENT nonce each time (the counter
+// always advances), closing the classic stream-cipher "two-time pad"
+// weakness a naive nonce = f(block_num)-only scheme would have. AAD =
+// block_num (8 bytes, BE, zero-padded) -- binds the tag to this
+// specific block number, so an attacker can't undetectably move a
+// valid ciphertext+tag pair from one block to another. Persists the
+// new counter and tag to the metadata region as part of this same
+// call.
+//
+// Fails closed (-2) if dharafs_crypto_key_init was never called --
+// see that function's own comment for why this check exists.
+fn dharafs_crypto_encrypt_block(block_num: i64, plaintext: mut ref i64, out_ciphertext: mut ref i64) -> i64 {
+  if dharafs_crypto_key_initialized_get() == (0 as u32) {
+    return 0 - 2;
+  }
+  let counter: i64 = dharafs_crypto_meta_read_counter(block_num) + 1;
+
+  let nonce: mut ref i64 = dharafs_crypto_nonce_ptr();
+  let _ = buf_write_u32_be(nonce, 0, block_num as u32);
+  let _ = buf_write_u32_be(nonce, 4, counter as u32);
+  let _ = buf_write_u32_be(nonce, 8, 0 as u32);
+
+  let aad: mut ref i64 = dharafs_crypto_aad_scratch_ptr();
+  let _ = buf_write_u32_be(aad, 0, 0 as u32);
+  let _ = buf_write_u32_be(aad, 4, block_num as u32);
+
+  let key: mut ref i64 = dharafs_crypto_key_ptr();
+  let state_buf: mut ref i64 = dharafs_crypto_state_ptr();
+  let working_buf: mut ref i64 = dharafs_crypto_working_ptr();
+  let keystream_buf: mut ref i64 = dharafs_crypto_keystream_ptr();
+  let block_scratch: mut ref i64 = dharafs_crypto_block_scratch_ptr();
+  let otk_scratch: mut ref i64 = dharafs_crypto_otk_scratch_ptr();
+  let mac_data_scratch: mut ref i64 = dharafs_crypto_mac_data_scratch_ptr();
+  let tag: mut ref i64 = dharafs_crypto_tag_scratch_ptr();
+
+  let _ = chacha20_poly1305_encrypt(key, nonce, aad, 8, plaintext, 512,
+                                     state_buf, working_buf, keystream_buf,
+                                     block_scratch, otk_scratch, mac_data_scratch,
+                                     out_ciphertext, tag);
+
+  return dharafs_crypto_meta_write_entry(block_num, counter, tag);
+}
+
+// Decrypts one 512-byte on-disk block. Fails CLOSED: returns -1 (and
+// leaves out_plaintext untouched) on ANY tag mismatch, whether from
+// real corruption or deliberate tampering -- "reject, don't guess." A
+// write-counter of 0 (no metadata entry, or a garbage/foreign sector)
+// is a deliberate, honest exception, not a failure: it means this
+// block was never AEAD-protected (predates encryption being enabled,
+// or was written while it was off), so there is no tag to check, and
+// the bytes are passed through unchanged as plaintext -- matching
+// dharafs_block_read/write's own pre-existing "encryption off"
+// passthrough for the not-yet-encrypted portion of a disk.
+//
+// Fails closed (-2) if dharafs_crypto_key_init was never called.
+fn dharafs_crypto_decrypt_block(block_num: i64, ciphertext: mut ref i64, out_plaintext: mut ref i64) -> i64 {
+  if dharafs_crypto_key_initialized_get() == (0 as u32) {
+    return 0 - 2;
+  }
+  let counter: i64 = dharafs_crypto_meta_read_counter(block_num);
+  if counter == 0 {
+    let i: i64 = 0;
+    while i < 512 {
+      let _ = buf_write_byte(out_plaintext, i as u32, buf_read_byte(ciphertext, i as u32));
+      i = i + 1;
+    }
+    return 0;
+  }
+
+  let tag: mut ref i64 = dharafs_crypto_tag_scratch_ptr();
+  let meta_status: i64 = dharafs_crypto_meta_read_tag(block_num, tag);
+  if meta_status != 0 {
+    return 0 - 1;
+  }
+
+  let nonce: mut ref i64 = dharafs_crypto_nonce_ptr();
+  let _ = buf_write_u32_be(nonce, 0, block_num as u32);
+  let _ = buf_write_u32_be(nonce, 4, counter as u32);
+  let _ = buf_write_u32_be(nonce, 8, 0 as u32);
+
+  let aad: mut ref i64 = dharafs_crypto_aad_scratch_ptr();
+  let _ = buf_write_u32_be(aad, 0, 0 as u32);
+  let _ = buf_write_u32_be(aad, 4, block_num as u32);
+
+  let key: mut ref i64 = dharafs_crypto_key_ptr();
+  let state_buf: mut ref i64 = dharafs_crypto_state_ptr();
+  let working_buf: mut ref i64 = dharafs_crypto_working_ptr();
+  let keystream_buf: mut ref i64 = dharafs_crypto_keystream_ptr();
+  let block_scratch: mut ref i64 = dharafs_crypto_block_scratch_ptr();
+  let otk_scratch: mut ref i64 = dharafs_crypto_otk_scratch_ptr();
+  let mac_data_scratch: mut ref i64 = dharafs_crypto_mac_data_scratch_ptr();
+  let computed_tag: mut ref i64 = dharafs_crypto_computed_tag_scratch_ptr();
+
+  return chacha20_poly1305_decrypt(key, nonce, aad, 8, ciphertext, 512, tag,
+                                    state_buf, working_buf, keystream_buf,
+                                    block_scratch, otk_scratch, mac_data_scratch,
+                                    computed_tag, out_plaintext);
+}
