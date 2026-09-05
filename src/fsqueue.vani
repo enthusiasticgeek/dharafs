@@ -1,0 +1,296 @@
+// DharaFS priority-aware FS request queue: an opt-in, bounded (8
+// slots) queue so a higher-priority task's write/delete can be
+// dispatched ahead of a lower-priority one's, instead of every
+// dharafs_* call running synchronously inline in whatever task called
+// it. Ported from Dhruva OS's own kernel/kernel_main.vani and
+// boot/fsqueue_state.S.
+//
+// This is the one piece of DharaFS Tier 1/2 deliberately left out:
+// dharafs_queue_submit (the Str convenience wrapper) tags a request
+// with the CALLING TASK's own current_eff_prio()/current_task_get(),
+// a genuine, unavoidable dependency on whatever scheduler the
+// consuming kernel has -- there is no portable default for "what is
+// this task's priority" the way there was for, say, the
+// media-encryption hook (which could default to off). A consumer
+// without a real multi-priority scheduler can still use this feature
+// correctly by stubbing both to a fixed value (e.g. 0) -- the queue
+// still works, every request just ties on priority and falls back to
+// pure FIFO (the seq field) ordering, which is a fine, honest
+// degradation, not a broken one.
+//
+// Every OTHER function here (dharafs_queue_submit_write_raw/
+// _submit_delete_raw take priority/task_id as explicit caller-
+// supplied parameters, not read from any scheduler) has ZERO
+// scheduler dependency and works standalone -- see
+// test/host_test_fsqueue.vani, which exercises the whole queue
+// (submit, priority ordering with FIFO tie-breaking, dispatch,
+// pending-count, full-queue and oversized-request rejection) without
+// ever calling dharafs_queue_submit or needing a real scheduler stub
+// for anything but that one function.
+//
+// Additive only: every existing dharafs_append_raw/dharafs_delete_raw
+// call site (direct, synchronous) is completely unaffected by linking
+// this file -- dharafs_queue_dispatch_one calls through to the exact
+// same functions, same crash-consistency guarantees, same dirindex
+// integration, nothing queue-specific about the actual FS operation
+// itself. Draining the queue (calling dispatch_one repeatedly from a
+// dedicated background task until it returns -1) is entirely the
+// consumer's own responsibility -- this package has no scheduler to
+// run such a task on.
+
+use "./core.vani";
+
+extern "C" fn current_eff_prio() -> u32;
+extern "C" fn current_task_get() -> u32;
+
+extern "C" fn fsqueue_path_scratch_get() -> mut ref i64;
+extern "C" fn fsqueue_data_scratch_get() -> mut ref i64;
+
+extern "C" fn fsqueue_valid_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_valid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_priority_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_priority_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_task_id_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_task_id_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_op_type_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_op_type_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_path_len_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_path_len_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_data_len_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_data_len_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_owner_uid_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_owner_uid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_owner_gid_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_owner_gid_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_mode_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_mode_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_seq_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_seq_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_result_get_at(index: u32) -> i64;
+extern "C" fn fsqueue_result_set_at(index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_next_seq_get() -> i64;
+extern "C" fn fsqueue_next_seq_set(value: u32) -> i64;
+extern "C" fn fsqueue_get_path_byte(combined_index: u32) -> i64;
+extern "C" fn fsqueue_set_path_byte(combined_index: u32, value: u32) -> i64;
+extern "C" fn fsqueue_get_data_byte(combined_index: u32) -> i64;
+extern "C" fn fsqueue_set_data_byte(combined_index: u32, value: u32) -> i64;
+
+fn fsqueue_max_slots() -> i64 { return 8; }
+fn fsqueue_max_data_bytes() -> i64 { return 448; } // must match dharafs_block_payload_cap()
+fn fsqueue_max_path_bytes() -> i64 { return 32; }
+
+fn dharafs_queue_reset() -> i64 {
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    let _ = fsqueue_valid_set_at(i as u32, 0 as u32);
+    i = i + 1;
+  }
+  let _ = fsqueue_next_seq_set(0 as u32);
+  return 0;
+}
+
+fn dharafs_queue_find_free_slot() -> i64 {
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    if fsqueue_valid_get_at(i as u32) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+// Enqueues a write/append request tagged with `priority` (this
+// project's own "0 is highest" scheduler convention -- callers
+// normally pass current_eff_prio()) instead of running it inline.
+// Returns the slot index on success, -1 if the path/data is oversized
+// or the queue (8 slots) is full. A full queue is never silently
+// dropped for the caller -- -1 tells them to fall back to calling
+// dharafs_append_raw directly, exactly what every existing call site
+// still does.
+fn dharafs_queue_submit_write_raw(priority: u32, task_id: u32, path_buf: mut ref i64, path_len: i64, data_buf: mut ref i64, data_len: i64, owner_uid: u32, owner_gid: u32, mode: u32) -> i64 {
+  if (path_len <= 0) || (path_len > fsqueue_max_path_bytes()) {
+    return 0 - 1;
+  }
+  if (data_len < 0) || (data_len > fsqueue_max_data_bytes()) {
+    return 0 - 1;
+  }
+  let slot: i64 = dharafs_queue_find_free_slot();
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let seq: u32 = fsqueue_next_seq_get() as u32;
+  let _ = fsqueue_next_seq_set(seq + (1 as u32));
+  let _ = fsqueue_priority_set_at(slot as u32, priority);
+  let _ = fsqueue_task_id_set_at(slot as u32, task_id);
+  let _ = fsqueue_op_type_set_at(slot as u32, 1 as u32); // 1 = write/append
+  let _ = fsqueue_path_len_set_at(slot as u32, path_len as u32);
+  let _ = fsqueue_data_len_set_at(slot as u32, data_len as u32);
+  let _ = fsqueue_owner_uid_set_at(slot as u32, owner_uid);
+  let _ = fsqueue_owner_gid_set_at(slot as u32, owner_gid);
+  let _ = fsqueue_mode_set_at(slot as u32, mode);
+  let _ = fsqueue_seq_set_at(slot as u32, seq);
+  let _ = fsqueue_result_set_at(slot as u32, 2 as u32); // 2 = pending (not yet dispatched)
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = buf_read_byte(path_buf, k as u32);
+    let _ = fsqueue_set_path_byte((slot * fsqueue_max_path_bytes() + k) as u32, b);
+    k = k + 1;
+  }
+  let j: i64 = 0;
+  while j < data_len {
+    let b2: u32 = buf_read_byte(data_buf, j as u32);
+    let _ = fsqueue_set_data_byte((slot * fsqueue_max_data_bytes() + j) as u32, b2);
+    j = j + 1;
+  }
+  let _ = fsqueue_valid_set_at(slot as u32, 1 as u32);
+  return slot;
+}
+
+// Same as dharafs_queue_submit_write_raw, but for a delete (tombstone)
+// request -- mirrors dharafs_delete_raw's own argument shape.
+fn dharafs_queue_submit_delete_raw(priority: u32, task_id: u32, path_buf: mut ref i64, path_len: i64) -> i64 {
+  if (path_len <= 0) || (path_len > fsqueue_max_path_bytes()) {
+    return 0 - 1;
+  }
+  let slot: i64 = dharafs_queue_find_free_slot();
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let seq: u32 = fsqueue_next_seq_get() as u32;
+  let _ = fsqueue_next_seq_set(seq + (1 as u32));
+  let _ = fsqueue_priority_set_at(slot as u32, priority);
+  let _ = fsqueue_task_id_set_at(slot as u32, task_id);
+  let _ = fsqueue_op_type_set_at(slot as u32, 2 as u32); // 2 = delete
+  let _ = fsqueue_path_len_set_at(slot as u32, path_len as u32);
+  let _ = fsqueue_data_len_set_at(slot as u32, 0 as u32);
+  let _ = fsqueue_seq_set_at(slot as u32, seq);
+  let _ = fsqueue_result_set_at(slot as u32, 2 as u32);
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = buf_read_byte(path_buf, k as u32);
+    let _ = fsqueue_set_path_byte((slot * fsqueue_max_path_bytes() + k) as u32, b);
+    k = k + 1;
+  }
+  let _ = fsqueue_valid_set_at(slot as u32, 1 as u32);
+  return slot;
+}
+
+// Str convenience wrapper, same relationship to dharafs_queue_submit_
+// write_raw as dharafs_append has to dharafs_append_raw. Tags the
+// request with the CALLING task's own current_eff_prio()/
+// current_task_get() automatically -- the whole point of this queue
+// is "let the caller's real scheduling priority decide FS ordering,"
+// so the common case shouldn't require the caller to look those up
+// itself. The one function in this file with a real scheduler
+// dependency -- see this file's own header comment.
+fn dharafs_queue_submit(path: Str, data: Str) -> i64 {
+  let path_len: i64 = str_len_bytes(path);
+  let data_len: i64 = str_len_bytes(data);
+  if (path_len <= 0) || (path_len > 32) {
+    return 0 - 1;
+  }
+  if data_len > fsqueue_max_data_bytes() {
+    return 0 - 1;
+  }
+  let meta_buf: mut ref i64 = dharafs_stat_scratch_get();
+  let stat_status: i64 = dharafs_stat(path, meta_buf);
+  let owner_uid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 0 as u32) } else { dharafs_user_get_uid() };
+  let owner_gid: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 4 as u32) } else { dharafs_user_get_gid() };
+  let mode: u32 = if stat_status == 0 { buf_read_u32(meta_buf, 8 as u32) } else { dharafs_default_mode() };
+  let path_buf: mut ref i64 = dharafs_path_scratch_get();
+  let i: i64 = 0;
+  while i < path_len {
+    let _ = buf_write_byte(path_buf, i as u32, str_byte_at(path, i) as u32);
+    i = i + 1;
+  }
+  let data_buf: mut ref i64 = dharafs_data_scratch_get();
+  let j: i64 = 0;
+  while j < data_len {
+    let _ = buf_write_byte(data_buf, j as u32, str_byte_at(data, j) as u32);
+    j = j + 1;
+  }
+  return dharafs_queue_submit_write_raw(current_eff_prio(), current_task_get(), path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+}
+
+// Scans every valid slot, returns the index of the one with the
+// numerically LOWEST priority (highest real priority, this project's
+// own scheduler convention), oldest submission (seq) breaking ties --
+// FIFO fairness among equal-priority requests rather than an
+// arbitrary/undefined tie order. -1 if the queue is empty.
+fn dharafs_queue_pick_next() -> i64 {
+  let best: i64 = 0 - 1;
+  let best_priority: u32 = 0 as u32;
+  let best_seq: u32 = 0 as u32;
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    if fsqueue_valid_get_at(i as u32) == 1 {
+      let p: u32 = fsqueue_priority_get_at(i as u32) as u32;
+      let s: u32 = fsqueue_seq_get_at(i as u32) as u32;
+      let is_better: i64 = if best < 0 { 1 } else { if (p < best_priority) || ((p == best_priority) && (s < best_seq)) { 1 } else { 0 } };
+      if is_better == 1 {
+        best = i;
+        best_priority = p;
+        best_seq = s;
+      }
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+// Processes exactly the ONE highest-priority pending request (via
+// dharafs_queue_pick_next), through the exact same dharafs_append_raw/
+// dharafs_delete_raw every synchronous caller already uses -- same
+// crash-consistency guarantees, same dharafs_dirindex integration,
+// nothing queue-specific about the actual FS operation itself. Meant
+// to be called repeatedly by a consumer-owned background task until
+// it returns -1 (queue drained). Returns the FS op's own result
+// (0 = success, 1 = failure) or -1 if the queue was already empty.
+fn dharafs_queue_dispatch_one() -> i64 {
+  let slot: i64 = dharafs_queue_pick_next();
+  if slot < 0 {
+    return 0 - 1;
+  }
+  let op: u32 = fsqueue_op_type_get_at(slot as u32) as u32;
+  let path_len: i64 = fsqueue_path_len_get_at(slot as u32);
+  let path_buf: mut ref i64 = fsqueue_path_scratch_get();
+  let k: i64 = 0;
+  while k < path_len {
+    let b: u32 = fsqueue_get_path_byte((slot * fsqueue_max_path_bytes() + k) as u32) as u32;
+    let _ = buf_write_byte(path_buf, k as u32, b);
+    k = k + 1;
+  }
+  let result: i64 = 0 - 1;
+  if op == (2 as u32) {
+    result = dharafs_delete_raw(path_buf, path_len);
+  } else {
+    let data_len: i64 = fsqueue_data_len_get_at(slot as u32);
+    let data_buf: mut ref i64 = fsqueue_data_scratch_get();
+    let j: i64 = 0;
+    while j < data_len {
+      let b2: u32 = fsqueue_get_data_byte((slot * fsqueue_max_data_bytes() + j) as u32) as u32;
+      let _ = buf_write_byte(data_buf, j as u32, b2);
+      j = j + 1;
+    }
+    let owner_uid: u32 = fsqueue_owner_uid_get_at(slot as u32) as u32;
+    let owner_gid: u32 = fsqueue_owner_gid_get_at(slot as u32) as u32;
+    let mode: u32 = fsqueue_mode_get_at(slot as u32) as u32;
+    result = dharafs_append_raw(path_buf, path_len, data_buf, data_len, owner_uid, owner_gid, mode);
+  }
+  let _ = fsqueue_result_set_at(slot as u32, result as u32);
+  let _ = fsqueue_valid_set_at(slot as u32, 0 as u32);
+  return result;
+}
+
+fn dharafs_queue_pending_count() -> i64 {
+  let count: i64 = 0;
+  let i: i64 = 0;
+  while i < fsqueue_max_slots() {
+    if fsqueue_valid_get_at(i as u32) == 1 {
+      count = count + 1;
+    }
+    i = i + 1;
+  }
+  return count;
+}

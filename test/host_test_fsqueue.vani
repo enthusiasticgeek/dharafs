@@ -1,0 +1,190 @@
+// DharaFS fsqueue (Tier 3) test suite: priority ordering (with FIFO
+// tie-breaking), dispatch draining, pending-count accuracy, full-queue
+// and oversized-request rejection, delete-via-queue, and the one
+// scheduler-dependent function (dharafs_queue_submit) against a fixed
+// stub -- all via src/lib_queued.vani, with zero dependency on media
+// encryption or verified I/O.
+//
+// Run with:
+//   vanic run test/host_test_fsqueue.vani --backend=c \
+//     --link-with runtime/dharafs_runtime.c \
+//     --link-with runtime/dharafs_fsqueue_runtime.c \
+//     --link-with test/host_stubs.c \
+//     --link-with test/host_stubs_tier1_crypto_stub.c \
+//     --link-with test/host_stubs_scheduler_stub.c
+
+use "../src/lib_queued.vani";
+
+fn test_alloc_str(s: Str) -> mut ref i64 {
+  let n: i64 = str_len_bytes(s);
+  let buf: mut ref i64 = dharafs_alloc_bytes(n);
+  let _ = str_copy_to_buf(s, buf);
+  return buf;
+}
+
+fn main() -> i64 {
+  let init_status: i64 = dharafs_init();
+  assert init_status == 0;
+
+  // ---- Priority ordering with FIFO tie-breaking ----
+  {
+    let _ = dharafs_queue_reset();
+    assert dharafs_queue_pending_count() == 0;
+
+    let uid: u32 = dharafs_user_get_uid();
+    let gid: u32 = dharafs_user_get_gid();
+    let mode: u32 = dharafs_default_mode();
+
+    // Submitted in this order: A(prio 5), B(prio 2), C(prio 8), D(prio 2).
+    // Expected dispatch order: B, D (same prio as B, later seq -> FIFO
+    // after B), A, C.
+    let slot_a: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, test_alloc_str("fileA"), 5, test_alloc_str("dataA"), 5, uid, gid, mode);
+    let slot_b: i64 = dharafs_queue_submit_write_raw(2 as u32, 1 as u32, test_alloc_str("fileB"), 5, test_alloc_str("dataB"), 5, uid, gid, mode);
+    let slot_c: i64 = dharafs_queue_submit_write_raw(8 as u32, 1 as u32, test_alloc_str("fileC"), 5, test_alloc_str("dataC"), 5, uid, gid, mode);
+    let slot_d: i64 = dharafs_queue_submit_write_raw(2 as u32, 1 as u32, test_alloc_str("fileD"), 5, test_alloc_str("dataD"), 5, uid, gid, mode);
+    assert slot_a == 0;
+    assert slot_b == 1;
+    assert slot_c == 2;
+    assert slot_d == 3;
+    assert dharafs_queue_pending_count() == 4;
+
+    // None of the 4 files are actually committed to the FS yet --
+    // submitting only fills the queue table.
+    let probe: mut ref i64 = dharafs_alloc_bytes(4096);
+    assert dharafs_read("fileA", probe) < 0;
+    assert dharafs_read("fileB", probe) < 0;
+    assert dharafs_read("fileC", probe) < 0;
+    assert dharafs_read("fileD", probe) < 0;
+
+    let r1: i64 = dharafs_queue_dispatch_one();
+    assert r1 == 0;
+    assert dharafs_queue_pending_count() == 3;
+    let len_b: i64 = dharafs_read("fileB", probe);
+    assert len_b == 5;
+    assert buf_read_byte(probe, 0 as u32) == (100 as u32); // 'd' of "dataB"
+    assert dharafs_read("fileA", probe) < 0;
+    assert dharafs_read("fileC", probe) < 0;
+    assert dharafs_read("fileD", probe) < 0;
+
+    let r2: i64 = dharafs_queue_dispatch_one();
+    assert r2 == 0;
+    assert dharafs_queue_pending_count() == 2;
+    assert dharafs_read("fileD", probe) == 5;
+    assert dharafs_read("fileA", probe) < 0;
+    assert dharafs_read("fileC", probe) < 0;
+
+    let r3: i64 = dharafs_queue_dispatch_one();
+    assert r3 == 0;
+    assert dharafs_queue_pending_count() == 1;
+    assert dharafs_read("fileA", probe) == 5;
+    assert dharafs_read("fileC", probe) < 0;
+
+    let r4: i64 = dharafs_queue_dispatch_one();
+    assert r4 == 0;
+    assert dharafs_queue_pending_count() == 0;
+    assert dharafs_read("fileC", probe) == 5;
+
+    // Queue now empty.
+    let r5: i64 = dharafs_queue_dispatch_one();
+    assert r5 == (0 - 1);
+  }
+
+  // ---- Full-queue rejection ----
+  {
+    let _ = dharafs_queue_reset();
+    let uid: u32 = dharafs_user_get_uid();
+    let gid: u32 = dharafs_user_get_gid();
+    let mode: u32 = dharafs_default_mode();
+
+    let i: i64 = 0;
+    while i < 8 {
+      let path: mut ref i64 = dharafs_alloc_bytes(2);
+      let _ = buf_write_byte(path, 0 as u32, 113 as u32); // 'q'
+      let _ = buf_write_byte(path, 1 as u32, (48 + i) as u32); // '0'..'7'
+      let data: mut ref i64 = dharafs_alloc_bytes(2);
+      let _ = buf_write_byte(data, 0 as u32, 100 as u32); // 'd'
+      let _ = buf_write_byte(data, 1 as u32, (48 + i) as u32);
+      let slot: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, path, 2, data, 2, uid, gid, mode);
+      assert slot == i;
+      i = i + 1;
+    }
+    assert dharafs_queue_pending_count() == 8;
+
+    // A 9th submission must be rejected -- the queue is full.
+    let overflow_slot: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, test_alloc_str("qX"), 2, test_alloc_str("dX"), 2, uid, gid, mode);
+    assert overflow_slot == (0 - 1);
+    assert dharafs_queue_pending_count() == 8; // rejection didn't consume a slot
+
+    // Drain it back to empty for the next test block.
+    let j: i64 = 0;
+    while j < 8 {
+      let _ = dharafs_queue_dispatch_one();
+      j = j + 1;
+    }
+    assert dharafs_queue_pending_count() == 0;
+  }
+
+  // ---- Oversized-request rejection (checked before any buffer
+  // access, so a dummy 1-byte buffer is safe here) ----
+  {
+    let uid: u32 = dharafs_user_get_uid();
+    let gid: u32 = dharafs_user_get_gid();
+    let mode: u32 = dharafs_default_mode();
+    let dummy: mut ref i64 = dharafs_alloc_bytes(1);
+
+    let oversized_path: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, dummy, 33, dummy, 1, uid, gid, mode);
+    assert oversized_path == (0 - 1);
+
+    let oversized_data: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, dummy, 1, dummy, 449, uid, gid, mode);
+    assert oversized_data == (0 - 1);
+
+    let negative_data: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, dummy, 1, dummy, 0 - 1, uid, gid, mode);
+    assert negative_data == (0 - 1);
+
+    let zero_path: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, dummy, 0, dummy, 1, uid, gid, mode);
+    assert zero_path == (0 - 1);
+
+    assert dharafs_queue_pending_count() == 0; // none of these consumed a slot
+  }
+
+  // ---- Delete via queue ----
+  {
+    let _ = dharafs_queue_reset();
+    let append_status: i64 = dharafs_append("todelete", "somedata");
+    assert append_status == 0;
+    let probe: mut ref i64 = dharafs_alloc_bytes(4096);
+    assert dharafs_read("todelete", probe) == 8;
+
+    let slot: i64 = dharafs_queue_submit_delete_raw(3 as u32, 1 as u32, test_alloc_str("todelete"), 8);
+    assert slot == 0;
+    assert dharafs_queue_pending_count() == 1;
+    assert dharafs_read("todelete", probe) == 8; // not yet dispatched
+
+    let dispatch_status: i64 = dharafs_queue_dispatch_one();
+    assert dispatch_status == 0;
+    assert dharafs_queue_pending_count() == 0;
+    assert dharafs_read("todelete", probe) < 0; // deleted
+  }
+
+  // ---- dharafs_queue_submit (the Str wrapper with a real scheduler
+  // dependency -- current_eff_prio()/current_task_get(), fixed at 5/1
+  // by test/host_stubs_scheduler_stub.c) ----
+  {
+    let _ = dharafs_queue_reset();
+    let slot: i64 = dharafs_queue_submit("viaqueue", "hello via queue submit");
+    assert slot == 0;
+    assert dharafs_queue_pending_count() == 1;
+    let probe: mut ref i64 = dharafs_alloc_bytes(4096);
+    assert dharafs_read("viaqueue", probe) < 0; // not yet dispatched
+
+    let dispatch_status: i64 = dharafs_queue_dispatch_one();
+    assert dispatch_status == 0;
+    assert dharafs_queue_pending_count() == 0;
+    let read_len: i64 = dharafs_read("viaqueue", probe);
+    assert read_len == 22; // str_len_bytes("hello via queue submit")
+    assert buf_read_byte(probe, 0 as u32) == (104 as u32); // 'h'
+  }
+
+  let _ = dharafs_log_puts("DharaFS fsqueue (Tier 3) test suite: PASS\n");
+  return 0;
+}

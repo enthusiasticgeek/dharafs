@@ -1,0 +1,26 @@
+// DharaFS -- Tier 3 entry point: everything. Core filesystem + real
+// ChaCha20-Poly1305 AEAD media encryption + SHA-256-verified
+// companion-file I/O + the priority-aware FS request queue. The only
+// consumer-provided seams are the same 6 environment-specific ones
+// Tier 1 always needs (block I/O, allocator, logging) plus
+// current_eff_prio/current_task_get (the queue's own one genuine
+// scheduler dependency -- stubbable to a fixed value if you have no
+// real per-task priority concept, see this file's own fsqueue.vani).
+//
+// Link: runtime/dharafs_runtime.c, runtime/dharafs_crypto_runtime.c,
+// runtime/dharafs_media_crypto_runtime.c,
+// runtime/dharafs_verified_io_runtime.c,
+// runtime/dharafs_fsqueue_runtime.c. See test/host_test_tier3.vani for
+// a worked example.
+//
+// Want a smaller combination? src/lib_tier2.vani (encryption +
+// verified I/O, no queue), src/lib_queued.vani (queue only, no
+// encryption/verified I/O), src/lib_encrypted.vani, and
+// src/lib_verified.vani cover the other four points in this matrix --
+// see README.md.
+
+use "./core.vani";
+use "./crypto.vani";
+use "./media_crypto.vani";
+use "./verified_io.vani";
+use "./fsqueue.vani";

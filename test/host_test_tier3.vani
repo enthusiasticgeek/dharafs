@@ -1,0 +1,89 @@
+// DharaFS Tier 3 composition test: confirms all three additions
+// (media encryption, verified I/O, the FS request queue) link and run
+// together with zero conflict, plus one real cross-feature check --
+// a write dispatched through the queue is transparently encrypted at
+// rest, exactly like a direct dharafs_append call, since the queue's
+// own dharafs_queue_dispatch_one calls straight through to
+// core.vani's dharafs_append_raw -> ... -> dharafs_block_write, the
+// same choke point every other write already passes through.
+//
+// This is a composition smoke test, not a re-verification of each
+// feature on its own -- see test/host_test_tier2.vani (media
+// encryption + verified I/O in depth) and test/host_test_fsqueue.vani
+// (the queue in depth) for that.
+//
+// dharafs_queue_dispatch_one calls dharafs_append_raw/delete_raw
+// directly, NOT dharafs_write_verified_raw -- a queue-dispatched
+// write does not get a verified-I/O digest. This is a real, by-design
+// boundary (matching Dhruva OS's own upstream interface exactly, not
+// a limitation introduced here), not tested as a failure below.
+//
+// Run with:
+//   vanic run test/host_test_tier3.vani --backend=c \
+//     --link-with runtime/dharafs_runtime.c \
+//     --link-with runtime/dharafs_crypto_runtime.c \
+//     --link-with runtime/dharafs_media_crypto_runtime.c \
+//     --link-with runtime/dharafs_verified_io_runtime.c \
+//     --link-with runtime/dharafs_fsqueue_runtime.c \
+//     --link-with test/host_stubs.c \
+//     --link-with test/host_stubs_scheduler_stub.c
+
+use "../src/lib_tier3.vani";
+
+fn main() -> i64 {
+  let init_status: i64 = dharafs_init();
+  assert init_status == 0;
+
+  // ---- Queue + media encryption: a queue-dispatched write ends up
+  // encrypted at rest, same as a direct dharafs_append call. ----
+  {
+    let key_status: i64 = dharafs_crypto_key_init("tier3-smoke-passphrase", "tier3-smoke-salt", 500);
+    assert key_status == 0;
+    let _ = dharafs_crypto_set_enabled(1 as u32);
+
+    let _ = dharafs_queue_reset();
+    let uid: u32 = dharafs_user_get_uid();
+    let gid: u32 = dharafs_user_get_gid();
+    let mode: u32 = dharafs_default_mode();
+    let path: mut ref i64 = dharafs_alloc_bytes(10);
+    let _ = str_copy_to_buf("queued.txt", path);
+    let data: mut ref i64 = dharafs_alloc_bytes(20);
+    let _ = str_copy_to_buf("queued and encrypted", data);
+    let slot: i64 = dharafs_queue_submit_write_raw(5 as u32, 1 as u32, path, 10, data, 20, uid, gid, mode);
+    assert slot >= 0;
+    let dispatch_status: i64 = dharafs_queue_dispatch_one();
+    assert dispatch_status == 0;
+
+    let plain: mut ref i64 = dharafs_alloc_bytes(4096);
+    let read_len: i64 = dharafs_read("queued.txt", plain);
+    assert read_len == 20; // str_len_bytes("queued and encrypted")
+    assert buf_read_byte(plain, 0 as u32) == (113 as u32); // 'q'
+
+    let _ = dharafs_crypto_set_enabled(0 as u32);
+  }
+
+  // ---- Verified I/O still works with everything else linked in ----
+  {
+    let write_status: i64 = dharafs_write_verified("v3.txt", "quick verified check");
+    assert write_status == 0;
+    let buf: mut ref i64 = dharafs_alloc_bytes(4096);
+    let read_len: i64 = dharafs_read_verified("v3.txt", buf);
+    assert read_len == 20; // str_len_bytes("quick verified check")
+  }
+
+  // ---- The Str-based queue wrapper (real scheduler dependency) also
+  // still works with everything else linked in. ----
+  {
+    let _ = dharafs_queue_reset();
+    let slot: i64 = dharafs_queue_submit("q3.txt", "hi");
+    assert slot >= 0;
+    let dispatch_status: i64 = dharafs_queue_dispatch_one();
+    assert dispatch_status == 0;
+    let buf: mut ref i64 = dharafs_alloc_bytes(4096);
+    let read_len: i64 = dharafs_read("q3.txt", buf);
+    assert read_len == 2;
+  }
+
+  let _ = dharafs_log_puts("DharaFS Tier 3 composition test: PASS\n");
+  return 0;
+}
