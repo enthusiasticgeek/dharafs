@@ -273,12 +273,22 @@ into the fixed-size C scratch buffers `runtime/*.c` allocates via `SCRATCH_BUF`/
 was ported from. `test/scratch_bounds_audit.py` statically catches the resulting bug class:
 a vani-side offset expression that can exceed a buffer's real C-side capacity, silently
 corrupting whatever static data sits next in memory. It flags (1) a literal offset that
-unconditionally overruns a buffer (DEFINITE) and (2) an offset derived from a `while VAR <
-BOUND` loop's own induction variable that overruns at the loop's maximum reachable value
-(REVIEW). It only resolves call sites that pass a buffer accessor (e.g.
-`sha256_h_scratch_get()`) directly as the first argument — call sites that receive the
-buffer through a function parameter are a documented, open gap (see the tool's own header
-comment). Current state: 0 DEFINITE, 0 REVIEW.
+unconditionally overruns a buffer, and (2) an offset derived from a `while VAR < BOUND`
+loop's own induction variable that overruns at the loop's maximum reachable value.
+
+Buffer identity is resolved in two tiers: DIRECT (the call site passes a buffer accessor,
+e.g. `sha256_h_scratch_get()`, straight in as the first argument — severity DEFINITE for
+check 1, REVIEW for check 2) and INTERPROCEDURAL (the first argument is a local variable or
+function parameter instead — the tool traces it backward through `let` bindings and,
+recursively, through every call site of the enclosing function, unioning results into a set
+of candidate buffers when a helper is genuinely called with more than one; always REVIEW,
+since the buffer identity itself is inferred rather than observed). Together the two tiers
+resolve 399 of 486 real call sites (82%); the remaining 87 are values from a
+consumer-provided allocator (`dharafs_alloc_bytes`) or other patterns outside what the
+tracer attempts — a documented, open gap, not silently claimed as covered. Pass
+`--log-level=DEBUG` to see the full resolution chain (call sites visited, locals traced,
+recursion-guard hits, unresolved leaves) for every call site — useful for checking why a
+particular one did or didn't resolve. Current state: 0 DEFINITE, 0 REVIEW.
 
 ## License
 
