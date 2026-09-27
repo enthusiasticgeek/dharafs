@@ -1,3 +1,4 @@
 *.o
 *.out
 /target/
+test/__pycache__/

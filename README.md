@@ -259,6 +259,27 @@ verified clean under AddressSanitizer/UndefinedBehaviorSanitizer (the only sanit
 are expected one-time startup allocations from the bump allocator, not leaks in a repeated
 code path — see `test/host_stubs.c`'s own comment).
 
+### Static scratch-buffer bounds audit
+
+```sh
+python3 test/scratch_bounds_audit.py
+```
+
+DharaFS has no hand-written assembly, so `buf_read_byte`/`buf_write_byte`/`buf_read_u32`/
+`buf_write_u32`/`buf_checksum` (declared in `src/buf_primitives.vani`, implemented in
+`runtime/dharafs_runtime.c`) give vani code entirely unchecked raw pointer+offset access
+into the fixed-size C scratch buffers `runtime/*.c` allocates via `SCRATCH_BUF`/
+`SCRATCH_BUF_PTR` — by design, matching the semantics of the upstream assembly this logic
+was ported from. `test/scratch_bounds_audit.py` statically catches the resulting bug class:
+a vani-side offset expression that can exceed a buffer's real C-side capacity, silently
+corrupting whatever static data sits next in memory. It flags (1) a literal offset that
+unconditionally overruns a buffer (DEFINITE) and (2) an offset derived from a `while VAR <
+BOUND` loop's own induction variable that overruns at the loop's maximum reachable value
+(REVIEW). It only resolves call sites that pass a buffer accessor (e.g.
+`sha256_h_scratch_get()`) directly as the first argument — call sites that receive the
+buffer through a function parameter are a documented, open gap (see the tool's own header
+comment). Current state: 0 DEFINITE, 0 REVIEW.
+
 ## License
 
 Apache License 2.0 — see `LICENSE` and `NOTICE`.
