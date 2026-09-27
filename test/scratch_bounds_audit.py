@@ -340,7 +340,7 @@ def parse_call_sites(function_defs):
 
 
 LET_OR_ASSIGN_RE = re.compile(
-    r"^\s*(?:let\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*[^=]+)?|([A-Za-z_][A-Za-z0-9_]*))\s*=\s*(?!=)(.+?);\s*$"
+    r"^\s*(?:let\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*[^=]+)?|([A-Za-z_][A-Za-z0-9_]*))\s*=\s*(?!=)(.+?);"
 )
 
 
